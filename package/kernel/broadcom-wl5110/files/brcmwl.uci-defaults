@@ -1,0 +1,26 @@
+#!/bin/sh
+# First boot after installing brcmwl5110: make wl0 a permanent member of the lan bridge (netifd
+# then adds it whenever it (re)creates br-lan) and write a disabled AP config without a key.
+
+case " $(uci -q get network.lan.ifname) " in
+	*" wl0 "*) ;;
+	*) uci set network.lan.ifname="$(uci -q get network.lan.ifname) wl0"; uci commit network ;;
+esac
+
+if [ -z "$(uci -q get wireless.radio0)" ]; then
+	touch /etc/config/wireless
+	uci -q batch <<UCI
+set wireless.radio0=wifi-device
+set wireless.radio0.type=brcmwl
+set wireless.radio0.channel=6
+set wireless.radio0.disabled=1
+set wireless.default_radio0=wifi-iface
+set wireless.default_radio0.device=radio0
+set wireless.default_radio0.network=lan
+set wireless.default_radio0.mode=ap
+set wireless.default_radio0.ssid=OpenWrt
+set wireless.default_radio0.encryption=psk2
+commit wireless
+UCI
+fi
+exit 0

@@ -1,0 +1,10 @@
+# wl.ko for OpenWrt 19.07.10 (Linux 4.14.275): closed 5.110.27 wlc core + Broadcom shared/ + new glue.
+obj-m := wl.o
+SHARED := aiutils bcmotp bcmsrom bcmutils hnddma hndpmu nicpci sbutils siutils
+wl-objs := wlc_core.o osl/linux_osl_414.o glue/wl_linux_414.o $(addprefix shared/,$(addsuffix .o,$(SHARED)))
+
+# Flags the ASUS kernel used for shared/ (hnd/Makefile + wlconfig_lx_shared + top Makefile).
+# HNDCTF/CTFPOOL/CTFMAP/PKTC deliberately OFF: shadow packets never use CTF (ctf_mac_len stays 0).
+BRCMFLAGS := -DBCMDRIVER -Dlinux -DBCMDBG_TRAP -DWLC_LOW -DWLC_HIGH -DBCMDMA32 -DBCMNVRAMR -DPHY_HAL \
+             -DBCM5354 -DLINUX_HYBRID_POSTPROCESSING_REMOVAL
+ccflags-y := -I$(src)/../glue -I$(src)/../wl_glue -I$(src)/include -I$(src)/shared $(BRCMFLAGS) -Wno-error -Wno-date-time
