@@ -1,5 +1,6 @@
 #!/bin/sh
 # /lib/wifi/brcmwl.sh - legacy /sbin/wifi driver for the ported Broadcom wl 5.110.27 (ASUS RT-N12 D1).
+# Configures the radio with wlc (GPL, from OpenWrt broadcom-wl, extended for 5.110); the stock wl is not needed.
 # Driven by /etc/config/wireless; called by `wifi` and at boot by /etc/init.d/network (wifi reload_legacy).
 #
 #   config wifi-device 'radio0'          config wifi-iface 'default_radio0'
@@ -14,11 +15,12 @@
 
 append DRIVERS "brcmwl"
 
-BRCMWL_WL=/usr/sbin/wl
+BRCMWL_WLC=/usr/sbin/wlc
 BRCMWL_IF=wl0
 BRCMWL_NASPID=/var/run/nas.$BRCMWL_IF.pid
 
 brcmwl_log() { logger -t brcmwl "$*"; echo "brcmwl: $*"; }
+brcmwl_wlc() { $BRCMWL_WLC ifname $BRCMWL_IF "$@"; }
 
 scan_brcmwl() {
 	return 0
@@ -46,7 +48,7 @@ disable_brcmwl() {
 	local device="$1" network vif
 	[ -f "$BRCMWL_NASPID" ] && start-stop-daemon -K -q -p "$BRCMWL_NASPID" && rm -f "$BRCMWL_NASPID"
 	[ -d /sys/class/net/$BRCMWL_IF ] || return 0
-	$BRCMWL_WL down >/dev/null 2>&1
+	brcmwl_wlc down >/dev/null 2>&1
 	config_get vifs "$device" vifs
 	for vif in $vifs; do
 		config_get network "$vif" network
@@ -101,20 +103,13 @@ enable_brcmwl() {
 
 	[ -n "$network" ] && { brcmwl_wait_network "$network" || brcmwl_log "network '$network' not up yet, continuing"; }
 
-	$BRCMWL_WL down
-	$BRCMWL_WL mpc 0
-	$BRCMWL_WL ap 1
-	$BRCMWL_WL infra 1
-	[ -n "$channel" ] && [ "$channel" != auto ] && $BRCMWL_WL channel "$channel"
-	$BRCMWL_WL closed "$hidden"
-	$BRCMWL_WL auth 0
-	$BRCMWL_WL wsec $wsec
-	$BRCMWL_WL wpa_auth $auth
-	$BRCMWL_WL wsec_restrict $restrict
-	$BRCMWL_WL eap_restrict 0
-	$BRCMWL_WL up
+	brcmwl_wlc down
+	brcmwl_wlc mpc 0 ap 1 infra 1
+	[ -n "$channel" ] && [ "$channel" != auto ] && brcmwl_wlc channel "$channel"
+	brcmwl_wlc closed "$hidden" wepauth 0 wsec $wsec wpa_auth $auth wsec_restrict $restrict eap_restrict 0
+	brcmwl_wlc up
 	ip link set $BRCMWL_IF up
-	$BRCMWL_WL ssid "$ssid" >/dev/null
+	brcmwl_wlc ssid "$ssid" >/dev/null
 
 	# At boot this runs before netifd has created the bridge; an add_device sent then is lost.
 	# Preferred: list wl0 in network.<net>.ifname (installer does this for lan) so netifd adds it itself.

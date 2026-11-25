@@ -75,12 +75,13 @@ define Package/brcmwl5110-utils
   SECTION:=net
   CATEGORY:=Network
   SUBMENU:=WirelessAPPS
-  TITLE:=Stock Broadcom wl tool for the 5.110 driver (with its uClibc)
+  TITLE:=Stock Broadcom wl tool for the 5.110 driver (optional diagnostics)
   DEPENDS:=+kmod-brcm-wl5110
 endef
 
 define Package/brcmwl5110-utils/description
- The stock ASUS/Broadcom 'wl' utility and the three uClibc libraries it needs,
+ Optional. The stock ASUS/Broadcom 'wl' utility (counters, sta_info, scan and
+ other diagnostics) and the three uClibc libraries it needs,
  extracted from the same firmware image. Installed under /usr/lib/brcm-wl (the
  loader as /lib/ld-uClibc.so.0) and run through the /usr/sbin/wl wrapper.
 endef
@@ -89,15 +90,16 @@ define Package/brcmwl5110
   SECTION:=net
   CATEGORY:=Network
   SUBMENU:=WirelessAPPS
-  TITLE:=/sbin/wifi support for the Broadcom 5.110 driver (type brcmwl)
-  DEPENDS:=+kmod-brcm-wl5110 +brcmwl5110-utils +nas
-  PKGARCH:=all
+  TITLE:=/sbin/wifi support for the Broadcom 5.110 driver (type brcmwl), with wlc
+  DEPENDS:=+kmod-brcm-wl5110 +nas
+  CONFLICTS:=wlc
 endef
 
 define Package/brcmwl5110/description
  Lets /etc/config/wireless (wifi-device type 'brcmwl') drive the 5.110 driver:
  AP mode, SSID, channel, hidden SSID, open/WPA2-PSK/mixed via nas, bridged into
- a netifd network.
+ a netifd network. Includes wlc (GPL, from OpenWrt's broadcom-wl, extended for
+ 5.110 with mpc/isup/rate/ver/autho_sta_list), so no ASUS userspace is needed.
 endef
 
 define Package/brcmwl5110/conffiles
@@ -122,6 +124,9 @@ define Build/Compile
 	+$(KERNEL_MAKE) M=$(PKG_BUILD_DIR)/wl_glue modules
 	+$(KERNEL_MAKE) M=$(PKG_BUILD_DIR)/wl \
 		KBUILD_EXTRA_SYMBOLS=$(PKG_BUILD_DIR)/wl_glue/Module.symvers modules
+	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) -Wno-pointer-sign \
+		-I$(PKG_BUILD_DIR)/wlc -I$(PKG_BUILD_DIR)/wl/include \
+		-o $(PKG_BUILD_DIR)/wlc/wlc $(PKG_BUILD_DIR)/wlc/wlc.c $(PKG_BUILD_DIR)/wlc/wlutils.c
 endef
 
 define Package/brcmwl5110-utils/install
@@ -135,7 +140,8 @@ define Package/brcmwl5110-utils/install
 endef
 
 define Package/brcmwl5110/install
-	$(INSTALL_DIR) $(1)/lib/wifi $(1)/etc/uci-defaults
+	$(INSTALL_DIR) $(1)/lib/wifi $(1)/etc/uci-defaults $(1)/usr/sbin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/wlc/wlc $(1)/usr/sbin/wlc
 	$(INSTALL_DATA) ./files/brcmwl.sh $(1)/lib/wifi/brcmwl.sh
 	$(INSTALL_BIN) ./files/brcmwl.uci-defaults $(1)/etc/uci-defaults/90-brcmwl
 endef
