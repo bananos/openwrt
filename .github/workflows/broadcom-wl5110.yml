@@ -1,0 +1,38 @@
+# Compile-only check for package/kernel/broadcom-wl5110.
+#
+# The build downloads the ASUS RT-N12 D1 firmware and extracts the proprietary Broadcom wl core
+# from it, so the resulting ipks contain Broadcom code: this workflow must never upload artifacts,
+# caches of the build directory or release assets. It only reports whether the packages build.
+name: broadcom-wl5110
+
+on:
+  push:
+    paths:
+      - 'package/kernel/broadcom-wl5110/**'
+      - '.github/ci/build-wl5110.sh'
+      - '.github/workflows/broadcom-wl5110.yml'
+  pull_request:
+    paths:
+      - 'package/kernel/broadcom-wl5110/**'
+      - '.github/ci/build-wl5110.sh'
+      - '.github/workflows/broadcom-wl5110.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host tools
+        # gawk: the SDK's package scan silently finds nothing with mawk
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gawk python3-pyelftools unzip xz-utils zlib1g-dev
+
+      - name: Build
+        run: .github/ci/build-wl5110.sh "$RUNNER_TEMP/wl5110"
