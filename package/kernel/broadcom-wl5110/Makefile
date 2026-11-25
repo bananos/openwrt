@@ -14,6 +14,7 @@ PKG_VERSION:=5.110.27.20012
 PKG_RELEASE:=1
 PKG_LICENSE:=Proprietary (core, extracted at build time) ISC GPL-2.0
 PKG_MAINTAINER:=
+PKG_CONFIG_DEPENDS:=CONFIG_BRCMWL5110_CFG80211
 
 BRCMWL5110_FW:=$(call qstrip,$(CONFIG_BRCMWL5110_FIRMWARE))
 ifeq ($(BRCMWL5110_FW),)
@@ -47,9 +48,16 @@ $(eval $(call Download,sasquatch))
 define KernelPackage/brcm-wl5110
   SUBMENU:=Wireless Drivers
   TITLE:=Broadcom wl 5.110 driver for BCM5357 (ASUS RT-N12 D1)
-  DEPENDS:=@TARGET_brcm47xx_mips74k @!PACKAGE_kmod-brcm-wl
+  DEPENDS:=@TARGET_brcm47xx_mips74k @!PACKAGE_kmod-brcm-wl +BRCMWL5110_CFG80211:kmod-cfg80211
   FILES:=$(PKG_BUILD_DIR)/wl_glue/wl_glue.ko $(PKG_BUILD_DIR)/wl/wl.ko
-  AUTOLOAD:=$(call AutoProbe,wl_glue wl)
+  # cfg80211 first: backports leaves no Module.symvers, so wl.ko's modinfo can't name it as a dependency
+  AUTOLOAD:=$(call AutoProbe,$(if $(CONFIG_BRCMWL5110_CFG80211),cfg80211) wl_glue wl)
+endef
+
+define KernelPackage/brcm-wl5110/install
+	$(if $(CONFIG_BRCMWL5110_CFG80211), \
+		$(INSTALL_DIR) $(1)/etc/uci-defaults && \
+		$(INSTALL_BIN) ./files/wl5110-cfg80211.uci-defaults $(1)/etc/uci-defaults/90-wl5110-cfg80211)
 endef
 
 define KernelPackage/brcm-wl5110/description
@@ -68,6 +76,15 @@ define KernelPackage/brcm-wl5110/config
 		  Path to an RT-N12 D1 firmware image to extract the wl core from:
 		  the ASUS .zip or .trx, or a dump of your router's flash (mtd1 or the
 		  whole 8 MB). Leave empty to download ASUS 3.0.0.4.374.813.
+
+	config BRCMWL5110_CFG80211
+		bool "Register the radio with cfg80211 (experimental)"
+		default n
+		help
+		  Work in progress: the radio becomes a normal OpenWrt "mac80211"
+		  wifi-device on interface wlan0, run by netifd and OpenWrt's own
+		  hostapd (wpad), and shown in LuCI. The brcmwl5110 package (wlc,
+		  nas) is then not needed. Pulls in kmod-cfg80211 and iw.
   endif
 endef
 
@@ -120,10 +137,23 @@ define Build/Prepare
 	$(CP) $(PKG_BUILD_DIR)/blob/wlc_core.o_shipped $(PKG_BUILD_DIR)/wl/
 endef
 
+ifdef CONFIG_BRCMWL5110_CFG80211
+  # build against OpenWrt's cfg80211 (mac80211 backports), not the kernel's own headers
+  WL_CFG80211_MAKE:=WL_CFG80211=y \
+	NOSTDINC_FLAGS="-I$(STAGING_DIR)/usr/include/mac80211-backport/uapi \
+		-I$(STAGING_DIR)/usr/include/mac80211-backport \
+		-I$(STAGING_DIR)/usr/include/mac80211/uapi \
+		-I$(STAGING_DIR)/usr/include/mac80211 \
+		-include backport/autoconf.h -include backport/backport.h" \
+	KBUILD_EXTRA_SYMBOLS="$(PKG_BUILD_DIR)/wl_glue/Module.symvers \
+		$(wildcard $(KERNEL_BUILD_DIR)/backports-*/Module.symvers)"
+else
+  WL_CFG80211_MAKE:=KBUILD_EXTRA_SYMBOLS=$(PKG_BUILD_DIR)/wl_glue/Module.symvers
+endif
+
 define Build/Compile
 	+$(KERNEL_MAKE) M=$(PKG_BUILD_DIR)/wl_glue modules
-	+$(KERNEL_MAKE) M=$(PKG_BUILD_DIR)/wl \
-		KBUILD_EXTRA_SYMBOLS=$(PKG_BUILD_DIR)/wl_glue/Module.symvers modules
+	+$(KERNEL_MAKE) M=$(PKG_BUILD_DIR)/wl $(WL_CFG80211_MAKE) modules
 	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) -Wno-pointer-sign \
 		-I$(PKG_BUILD_DIR)/wlc -I$(PKG_BUILD_DIR)/wl/include \
 		-o $(PKG_BUILD_DIR)/wlc/wlc $(PKG_BUILD_DIR)/wlc/wlc.c $(PKG_BUILD_DIR)/wlc/wlutils.c
@@ -143,7 +173,8 @@ define Package/brcmwl5110/install
 	$(INSTALL_DIR) $(1)/lib/wifi $(1)/etc/uci-defaults $(1)/usr/sbin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/wlc/wlc $(1)/usr/sbin/wlc
 	$(INSTALL_DATA) ./files/brcmwl.sh $(1)/lib/wifi/brcmwl.sh
-	$(INSTALL_BIN) ./files/brcmwl.uci-defaults $(1)/etc/uci-defaults/90-brcmwl
+	# the cfg80211 build is set up by its own defaults (type mac80211, wlan0); keep these for wl0 only
+	$(if $(CONFIG_BRCMWL5110_CFG80211),,$(INSTALL_BIN) ./files/brcmwl.uci-defaults $(1)/etc/uci-defaults/90-brcmwl)
 endef
 
 $(eval $(call KernelPackage,brcm-wl5110))

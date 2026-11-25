@@ -1,0 +1,74 @@
+#!/bin/sh
+# First boot with the cfg80211 build of kmod-brcm-wl5110. The radio is then driven by the OpenWrt
+# "mac80211" wireless handler (netifd + hostapd/wpad) on the single interface wlan0:
+#  - an existing radio of type brcmwl (wlc/nas setup) becomes type mac80211; SSID, encryption and
+#    key are kept as they are
+#  - without any wireless config, a disabled AP without a key is written (as the wlc build does)
+#  - every wifi-iface of the radio gets ifname wlan0: the driver has one fixed netdev and cannot
+#    create others, while mac80211.sh would otherwise ask for wlan<phy number>
+#  - wl0 is dropped from the lan bridge list: netifd bridges wlan0 itself
+
+. /lib/functions.sh
+
+phy=$(ls /sys/class/ieee80211 2>/dev/null | head -n1)
+if [ -n "$phy" ]; then
+	path=$(readlink -f /sys/class/ieee80211/$phy/device)
+	path=${path##/sys/devices/}		# as the detection in mac80211.sh computes it
+else
+	path=/sys/bcma0:1
+fi
+
+radio=
+find_radio() {
+	local type p
+	config_get type "$1" type
+	config_get p "$1" path
+	case "$type" in
+	brcmwl) radio=$1 ;;
+	mac80211) [ "$p" = "$path" ] && [ -z "$radio" ] && radio=$1 ;;
+	esac
+}
+config_load wireless
+config_foreach find_radio wifi-device
+
+if [ -z "$radio" ]; then
+	touch /etc/config/wireless
+	radio=radio0
+	uci -q batch <<UCI
+set wireless.radio0=wifi-device
+set wireless.radio0.channel=6
+set wireless.radio0.disabled=1
+set wireless.default_radio0=wifi-iface
+set wireless.default_radio0.device=radio0
+set wireless.default_radio0.network=lan
+set wireless.default_radio0.mode=ap
+set wireless.default_radio0.ssid=OpenWrt
+set wireless.default_radio0.encryption=psk2
+UCI
+fi
+
+uci -q batch <<UCI
+set wireless.$radio.type=mac80211
+set wireless.$radio.path=$path
+set wireless.$radio.hwmode=11g
+set wireless.$radio.htmode=HT20
+UCI
+
+set_ifname() {
+	local dev
+	config_get dev "$1" device
+	[ "$dev" = "$radio" ] && uci set wireless.$1.ifname=wlan0
+}
+config_load wireless
+config_foreach set_ifname wifi-iface
+uci commit wireless
+
+lan=
+for i in $(uci -q get network.lan.ifname); do
+	[ "$i" = wl0 ] || lan="$lan $i"
+done
+[ "${lan# }" = "$(uci -q get network.lan.ifname)" ] || {
+	uci set network.lan.ifname="${lan# }"
+	uci commit network
+}
+exit 0

@@ -23,6 +23,8 @@
 #include <linux/interrupt.h>
 #include <linux/timer.h>
 #include <linux/slab.h>
+#include <linux/sched.h>
+#include <linux/rtnetlink.h>
 #include <linux/uaccess.h>
 #include <linux/bcma/bcma.h>
 #include <asm/unaligned.h>
@@ -36,6 +38,7 @@
 #include <siutils.h>
 #include <pcicfg.h>
 #include <skb2622.h>
+#include "wl_cfg80211.h"
 #include <wl_export_5110.h>
 #include "wl_glue.h"
 
@@ -59,6 +62,7 @@ extern bool wlc_dpc(struct wlc_info *wlc, bool bounded);
 extern bool wlc_sendpkt(struct wlc_info *wlc, void *sdu, struct wlc_if *wlcif);
 extern int wlc_ioctl(struct wlc_info *wlc, int cmd, void *arg, int len, struct wlc_if *wlcif);
 extern int wlc_iovar_setint(struct wlc_info *wlc, const char *name, int arg);
+extern int wlc_iovar_getint(struct wlc_info *wlc, const char *name, int *arg);
 extern int wlc_iovar_op(struct wlc_info *wlc, const char *name, void *params, int p_len, void *arg,
 			int len, bool set, struct wlc_if *wlcif);
 
@@ -115,6 +119,7 @@ struct wl_info {
 	bool resched;
 	struct wl_timer *timers;
 	uint callbacks;
+	struct wl_cfg *cfg;		/* cfg80211 front end, NULL if not built */
 };
 
 #define WL_LOCK(wl)	spin_lock_bh(&(wl)->lock)
@@ -125,6 +130,10 @@ static int nompc = 1;
 module_param(nompc, int, 0);
 static int event_v1 = 1;
 module_param(event_v1, int, 0);
+static int trace_ioctl;
+static int event_ie_trim = 1;
+module_param(event_ie_trim, int, 0644);
+module_param(trace_ioctl, int, 0644);
 
 /* read-only debug counters: cat /sys/module/wl/parameters/memstat */
 extern int osl_dbg_stats(char *buf, size_t n);
@@ -134,6 +143,8 @@ static int memstat_get(char *buf, const struct kernel_param *kp)
 }
 static const struct kernel_param_ops memstat_ops = { .get = memstat_get };
 module_param_cb(memstat, &memstat_ops, NULL, 0444);
+MODULE_PARM_DESC(event_ie_trim, "1 = pass only the RSN/WPA IE of (re)assoc events to nas 5.10.56 (0: all IEs, debugging)");
+MODULE_PARM_DESC(trace_ioctl, "1 = log every wl ioctl from userspace (debugging)");
 MODULE_PARM_DESC(event_v1, "1 = convert wl_event_msg_t v2 frames to v1 for OpenWrt nas 5.10.56");
 MODULE_PARM_DESC(nompc, "1 (default) = disable Minimum Power Consumption: radio stays on while unassociated");
 
@@ -290,6 +301,11 @@ void wl_free_timer(struct wl_info *wl, struct wl_timer *t)
 #define BCMEV_V1_HDRLEN		70
 #define WLC_E_ASSOC_IND		8
 #define WLC_E_REASSOC_IND	10
+#define WLC_E_DEAUTH		5
+#define WLC_E_DEAUTH_IND	6
+#define WLC_E_DISASSOC		11
+#define WLC_E_DISASSOC_IND	12
+#define WLC_E_STATUS_SUCCESS	0
 
 /*
  * nas 5.10.56 (wpa_driver_assoc_msg) requires the (RE)ASSOC_IND payload to be exactly one IE, the
@@ -306,6 +322,8 @@ static void wl_event_assoc_ie_only(struct sk_buff *skb)
 	if ((type != WLC_E_ASSOC_IND && type != WLC_E_REASSOC_IND) ||
 	    len < 2 || BCMEV_V1_HDRLEN + len > skb->len)
 		return;
+	if (trace_ioctl)
+		print_hex_dump(KERN_INFO, "wl assoc-ies ", DUMP_PREFIX_OFFSET, 32, 1, ies, len, false);
 	for (p = ies; p + 2 <= ies + len && p + 2 + p[1] <= ies + len; p += 2 + p[1]) {
 		if (p[0] == 0x30) {				/* RSN IE: preferred */
 			pick = p;
@@ -315,7 +333,7 @@ static void wl_event_assoc_ie_only(struct sk_buff *skb)
 		    p[2] == 0x00 && p[3] == 0x50 && p[4] == 0xf2 && p[5] == 0x01)
 			pick = p;
 	}
-	if (!pick)
+	if (!pick || !event_ie_trim)
 		return;				/* open/WEP station: leave as is */
 	keep = 2 + pick[1];
 	if (keep == len)
@@ -341,6 +359,38 @@ static void wl_event_to_v1(struct sk_buff *skb)
 	wl_event_assoc_ie_only(skb);
 }
 
+#define BCMEV_OFF_STATUS	32
+#define BCMEV_OFF_ADDR		48
+
+/* station events for cfg80211; the frame itself still goes up for nas */
+static void wl_event_to_cfg(struct wl_info *wl, struct sk_buff *skb)
+{
+	u8 *d = skb->data;
+	u32 type, len;
+
+	if (!wl->cfg || skb->len < BCMEV_V2_HDRLEN || get_unaligned_be16(d + 12) != 0x886c ||
+	    d[BCMEV_OFF_OUI] != 0x00 || d[BCMEV_OFF_OUI + 1] != 0x10 || d[BCMEV_OFF_OUI + 2] != 0x18 ||
+	    get_unaligned_be16(d + BCMEV_OFF_USRSUB) != 1 || get_unaligned_be16(d + BCMEV_OFF_VER) != 2)
+		return;
+	type = get_unaligned_be32(d + BCMEV_OFF_TYPE);
+	len = get_unaligned_be32(d + BCMEV_OFF_DATALEN);
+	if (BCMEV_V2_HDRLEN + len > skb->len)
+		len = 0;
+	switch (type) {
+	case WLC_E_ASSOC_IND:
+	case WLC_E_REASSOC_IND:
+		if (get_unaligned_be32(d + BCMEV_OFF_STATUS) == WLC_E_STATUS_SUCCESS)
+			wl_cfg80211_sta_assoc(wl->cfg, d + BCMEV_OFF_ADDR, d + BCMEV_V2_HDRLEN, len);
+		break;
+	case WLC_E_DISASSOC_IND:
+	case WLC_E_DEAUTH_IND:
+	case WLC_E_DISASSOC:
+	case WLC_E_DEAUTH:
+		wl_cfg80211_sta_left(wl->cfg, d + BCMEV_OFF_ADDR);
+		break;
+	}
+}
+
 /* RX: shadow chain -> native skbs -> stack */
 void wl_sendup(struct wl_info *wl, struct wl_if *wlif, void *p, int numpkt)
 {
@@ -350,6 +400,7 @@ void wl_sendup(struct wl_info *wl, struct wl_if *wlif, void *p, int numpkt)
 	for (skb = osl_pkt_tonative(wl->osh, p); skb; skb = nxt) {
 		nxt = skb->next;
 		skb->next = NULL;
+		wl_event_to_cfg(wl, skb);
 		if (event_v1)
 			wl_event_to_v1(skb);
 		skb->dev = dev;
@@ -499,6 +550,7 @@ static int wl_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 	struct wl_info *wl = wlif->wl;
 	wl_ioctl_t ioc;
 	void *buf = NULL;
+	char vname[32] = "";
 	int err;
 
 	if (cmd != SIOCDEVPRIVATE)
@@ -519,11 +571,19 @@ static int wl_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 			return -EFAULT;
 		}
 	}
+	if (trace_ioctl && buf && (ioc.cmd == WLC_GET_VAR || ioc.cmd == WLC_SET_VAR))
+		strlcpy(vname, buf, min_t(uint, sizeof(vname), ioc.len + 1));
 	WL_LOCK(wl);
 	err = wlc_ioctl(wl->wlc, ioc.cmd, buf, ioc.len, wlif->wlcif);
 	if (err)
 		PUB_BCMERROR(wl->pub) = err;	/* read back by the tool via the "bcmerror" iovar */
 	WL_UNLOCK(wl);
+	if (trace_ioctl)
+		pr_info("wl ioctl %s cmd %d %s len %u set %u err %d\n", current->comm, ioc.cmd,
+			vname, ioc.len, ioc.set, err);
+	if (!err && ioc.cmd == WLC_SET_SSID && buf && ioc.len >= sizeof(wlc_ssid_t))
+		wl_cfg80211_ssid_changed(wl->cfg, ((wlc_ssid_t *)buf)->SSID,
+					 min_t(uint32, ((wlc_ssid_t *)buf)->SSID_len, 32));
 	if (!err && buf && copy_to_user(ioc.buf, buf, ioc.len))
 		err = BCME_BADADDR;
 	kfree(buf);
@@ -569,10 +629,296 @@ static const struct net_device_ops wl_netdev_ops = {
 
 /* ------------------------------------------------------------------ attach / detach */
 
+/* ------------------------------------------------------------------ helpers for wl_cfg80211.c */
+/* Process context: they may allocate with GFP_KERNEL and take the perimeter lock. */
+
+int wl_cfg_ioctl(struct wl_info *wl, int cmd, void *buf, int len)
+{
+	int err;
+
+	WL_LOCK(wl);
+	err = wlc_ioctl(wl->wlc, cmd, buf, len, wl->wlif->wlcif);
+	WL_UNLOCK(wl);
+	return err ? -EIO : 0;
+}
+
+int wl_cfg_iovar_getint(struct wl_info *wl, const char *name, int *val)
+{
+	int err;
+
+	WL_LOCK(wl);
+	err = wlc_iovar_getint(wl->wlc, name, val);
+	WL_UNLOCK(wl);
+	return err ? -EIO : 0;
+}
+
+int wl_cfg_iovar_setint(struct wl_info *wl, const char *name, int val)
+{
+	int err;
+
+	WL_LOCK(wl);
+	err = wlc_iovar_setint(wl->wlc, name, val);
+	WL_UNLOCK(wl);
+	return err ? -EIO : 0;
+}
+
+int wl_cfg_channel(struct wl_info *wl, int *chan)
+{
+	channel_info_t ci;
+	int err = wl_cfg_ioctl(wl, WLC_GET_CHANNEL, &ci, sizeof(ci));
+
+	if (!err)
+		*chan = ci.hw_channel;
+	return err;
+}
+
+int wl_cfg_valid_channels(struct wl_info *wl, u32 *chans, int max)
+{
+	uint buf[1 + 64];	/* wl_uint32_list_t */
+	int i, n, err;
+
+	buf[0] = 64;
+	err = wl_cfg_ioctl(wl, WLC_GET_VALID_CHANNELS, buf, sizeof(buf));
+	if (err)
+		return err;
+	n = min_t(int, buf[0], max);
+	for (i = 0; i < n; i++)
+		chans[i] = buf[1 + i];
+	return n;
+}
+
+int wl_cfg_assoclist(struct wl_info *wl, u8 (*macs)[6], int max)
+{
+	int i, n, err, len = sizeof(uint) + max * ETHER_ADDR_LEN;
+	struct maclist *ml = kmalloc(len, GFP_KERNEL);
+
+	if (!ml)
+		return -ENOMEM;
+	ml->count = max;
+	err = wl_cfg_ioctl(wl, WLC_GET_ASSOCLIST, ml, len);
+	n = err ? err : min_t(int, ml->count, max);
+	for (i = 0; i < n; i++)
+		memcpy(macs[i], &ml->ea[i], ETHER_ADDR_LEN);
+	kfree(ml);
+	return n;
+}
+
+int wl_cfg_sta_info(struct wl_info *wl, const u8 *mac, struct wl_cfg_sta *st)
+{
+	sta_info_t *si = kzalloc(WLC_IOCTL_SMLEN, GFP_KERNEL);
+	struct ether_addr ea;
+	scb_val_t sv;
+	int err;
+
+	if (!si)
+		return -ENOMEM;
+	memcpy(&ea, mac, ETHER_ADDR_LEN);
+	WL_LOCK(wl);
+	err = wlc_iovar_op(wl->wlc, "sta_info", &ea, ETHER_ADDR_LEN, si, WLC_IOCTL_SMLEN, FALSE,
+			   wl->wlif->wlcif);
+	WL_UNLOCK(wl);
+	if (err) {
+		kfree(si);
+		return -ENOENT;
+	}
+	memset(st, 0, sizeof(*st));
+	st->flags = ((si->flags & WL_STA_WME) ? WL_CFG_STA_WME : 0) |
+		    ((si->flags & WL_STA_AUTHE) ? WL_CFG_STA_AUTHE : 0) |
+		    ((si->flags & WL_STA_ASSOC) ? WL_CFG_STA_ASSOC : 0) |
+		    ((si->flags & WL_STA_AUTHO) ? WL_CFG_STA_AUTHO : 0) |
+		    ((si->flags & WL_STA_PS) ? WL_CFG_STA_PS : 0) |
+		    ((si->flags & WL_STA_N_CAP) ? WL_CFG_STA_HT : 0);
+	st->idle_s = si->idle;
+	st->connected_s = si->in;
+	if (si->len >= sizeof(sta_info_t)) {	/* version 3: counters and rates present */
+		st->tx_pkts = si->tx_pkts;
+		st->tx_failures = si->tx_failures;
+		st->rx_pkts = si->rx_ucast_pkts + si->rx_mcast_pkts;
+		st->tx_rate_kbps = si->tx_rate;
+		st->rx_rate_kbps = si->rx_rate;
+	}
+	kfree(si);
+
+	memset(&sv, 0, sizeof(sv));
+	memcpy(&sv.ea, mac, ETHER_ADDR_LEN);
+	if (!wl_cfg_ioctl(wl, WLC_GET_RSSI, &sv, sizeof(sv)))
+		st->rssi = (int32)sv.val;
+	return 0;
+}
+
+int wl_cfg_noise(struct wl_info *wl, int *dbm)
+{
+	int32 v;
+	int err = wl_cfg_ioctl(wl, WLC_GET_PHY_NOISE, &v, sizeof(v));
+
+	if (!err)
+		*dbm = v;
+	return err;
+}
+
+static int wl_cfg_setint(struct wl_info *wl, int cmd, int val)
+{
+	return wl_cfg_ioctl(wl, cmd, &val, sizeof(val));
+}
+
+/*
+ * The core only queues events whose bit is set in "event_msgs"; nas used to set them. Add the
+ * station events cfg80211 needs, keeping whatever else is enabled.
+ */
+static int wl_cfg_enable_events(struct wl_info *wl)
+{
+	static const int ev[] = { WLC_E_DEAUTH, WLC_E_DEAUTH_IND, WLC_E_ASSOC_IND, WLC_E_REASSOC_IND,
+				  WLC_E_DISASSOC, WLC_E_DISASSOC_IND };
+	u8 mask[WL_EVENTING_MASK_LEN];
+	int i, err;
+
+	WL_LOCK(wl);
+	err = wlc_iovar_op(wl->wlc, "event_msgs", NULL, 0, mask, sizeof(mask), FALSE, wl->wlif->wlcif);
+	if (!err) {
+		for (i = 0; i < ARRAY_SIZE(ev); i++)
+			mask[ev[i] / 8] |= 1 << (ev[i] % 8);
+		err = wlc_iovar_op(wl->wlc, "event_msgs", NULL, 0, mask, sizeof(mask), TRUE,
+				   wl->wlif->wlcif);
+	}
+	WL_UNLOCK(wl);
+	return err ? -EIO : 0;
+}
+
+/* same sequence as brcmwl.sh, which is known to work with this core */
+int wl_cfg_start_ap(struct wl_info *wl, const struct wl_cfg_ap *ap)
+{
+	int wsec = ((ap->wsec & WL_CFG_WSEC_WEP) ? WEP_ENABLED : 0) |
+		   ((ap->wsec & WL_CFG_WSEC_TKIP) ? TKIP_ENABLED : 0) |
+		   ((ap->wsec & WL_CFG_WSEC_AES) ? AES_ENABLED : 0);
+	int wpa_auth = ((ap->auth & WL_CFG_AUTH_WPA_PSK) ? WPA_AUTH_PSK : 0) |
+		       ((ap->auth & WL_CFG_AUTH_WPA2_PSK) ? WPA2_AUTH_PSK : 0) |
+		       ((ap->auth & WL_CFG_AUTH_WPA_8021X) ? WPA_AUTH_UNSPECIFIED : 0) |
+		       ((ap->auth & WL_CFG_AUTH_WPA2_8021X) ? WPA2_AUTH_UNSPECIFIED : 0);
+	bool eap = ap->auth & (WL_CFG_AUTH_WPA_8021X | WL_CFG_AUTH_WPA2_8021X);
+	wlc_ssid_t ssid;
+	int err;
+
+	if (ap->ssid_len < 0 || ap->ssid_len > sizeof(ssid.SSID))
+		return -EINVAL;
+	err = wl_cfg_ioctl(wl, WLC_DOWN, NULL, 0);
+	if (nompc)
+		err = err ?: wl_cfg_iovar_setint(wl, "mpc", 0);
+	err = err ?: wl_cfg_setint(wl, WLC_SET_AP, 1);
+	err = err ?: wl_cfg_setint(wl, WLC_SET_INFRA, 1);
+	err = err ?: wl_cfg_setint(wl, WLC_SET_CHANNEL, ap->channel);
+	if (!err && ap->beacon_int)
+		err = wl_cfg_setint(wl, WLC_SET_BCNPRD, ap->beacon_int);
+	if (!err && ap->dtim)
+		err = wl_cfg_setint(wl, WLC_SET_DTIMPRD, ap->dtim);
+	err = err ?: wl_cfg_setint(wl, WLC_SET_CLOSED, ap->hidden);
+	err = err ?: wl_cfg_setint(wl, WLC_SET_AUTH, ap->shared_key ? 1 : 0);
+	err = err ?: wl_cfg_setint(wl, WLC_SET_WSEC, wsec);
+	err = err ?: wl_cfg_setint(wl, WLC_SET_WPA_AUTH, wpa_auth);
+	err = err ?: wl_cfg_iovar_setint(wl, "wsec_restrict", wpa_auth || wsec ? 1 : 0);
+	err = err ?: wl_cfg_setint(wl, WLC_SET_EAP_RESTRICT, eap);
+	if (!err && ap->inactivity_s > 0 && wl_cfg_iovar_setint(wl, "scb_activity_time", ap->inactivity_s))
+		pr_warn("%s: could not set scb_activity_time %d\n", wl->dev->name, ap->inactivity_s);
+	err = err ?: wl_cfg_enable_events(wl);
+	err = err ?: wl_cfg_ioctl(wl, WLC_UP, NULL, 0);
+	if (err)
+		return err;
+	memset(&ssid, 0, sizeof(ssid));
+	ssid.SSID_len = ap->ssid_len;
+	memcpy(ssid.SSID, ap->ssid, ap->ssid_len);
+	return wl_cfg_ioctl(wl, WLC_SET_SSID, &ssid, sizeof(ssid));
+}
+
+int wl_cfg_stop_ap(struct wl_info *wl)
+{
+	return wl_cfg_ioctl(wl, WLC_DOWN, NULL, 0);
+}
+
+int wl_cfg_set_key(struct wl_info *wl, int idx, const u8 *mac, enum wl_cfg_cipher cipher,
+		   const u8 *key, int key_len, bool primary)
+{
+	static const uint32 algo[] = {
+		[WL_CFG_CIPHER_WEP40] = CRYPTO_ALGO_WEP1, [WL_CFG_CIPHER_WEP104] = CRYPTO_ALGO_WEP128,
+		[WL_CFG_CIPHER_TKIP] = CRYPTO_ALGO_TKIP, [WL_CFG_CIPHER_CCMP] = CRYPTO_ALGO_AES_CCM,
+	};
+	wl_wsec_key_t k;
+
+	if (cipher >= ARRAY_SIZE(algo) || key_len < 0 || key_len > sizeof(k.data))
+		return -EINVAL;
+	memset(&k, 0, sizeof(k));
+	k.index = idx;
+	k.len = key_len;
+	memcpy(k.data, key, key_len);
+	k.algo = algo[cipher];
+	if (mac)
+		memcpy(&k.ea, mac, ETHER_ADDR_LEN);	/* AP mode: TKIP MIC keys are not swapped */
+	else if (primary)
+		k.flags = WL_PRIMARY_KEY;
+	return wl_cfg_ioctl(wl, WLC_SET_KEY, &k, sizeof(k));
+}
+
+int wl_cfg_del_key(struct wl_info *wl, int idx, const u8 *mac)
+{
+	wl_wsec_key_t k;
+
+	memset(&k, 0, sizeof(k));
+	k.index = idx;
+	if (mac)
+		memcpy(&k.ea, mac, ETHER_ADDR_LEN);
+	return wl_cfg_ioctl(wl, WLC_SET_KEY, &k, sizeof(k));
+}
+
+/* group key TSC/PN, least significant byte first (as nas reads it for the GTK RSC) */
+int wl_cfg_key_seq(struct wl_info *wl, int idx, u8 seq[6])
+{
+	union { int32 idx; u8 b[8]; } buf;
+	int err;
+
+	memset(&buf, 0, sizeof(buf));
+	buf.idx = idx;
+	err = wl_cfg_ioctl(wl, WLC_GET_KEY_SEQ, &buf, sizeof(buf));
+	if (!err)
+		memcpy(seq, buf.b, 6);
+	return err;
+}
+
+int wl_cfg_authorize(struct wl_info *wl, const u8 *mac, bool authorized)
+{
+	struct ether_addr ea;
+
+	memcpy(&ea, mac, ETHER_ADDR_LEN);
+	return wl_cfg_ioctl(wl, authorized ? WLC_SCB_AUTHORIZE : WLC_SCB_DEAUTHORIZE, &ea, sizeof(ea));
+}
+
+int wl_cfg_deauth(struct wl_info *wl, const u8 *mac, int reason)
+{
+	scb_val_t sv;
+
+	memset(&sv, 0, sizeof(sv));
+	sv.val = reason;
+	memcpy(&sv.ea, mac, ETHER_ADDR_LEN);
+	return wl_cfg_ioctl(wl, WLC_SCB_DEAUTHENTICATE_FOR_REASON, &sv, sizeof(sv));
+}
+
+int wl_cfg_ssid(struct wl_info *wl, u8 *ssid, int *len)
+{
+	wlc_ssid_t s;
+	int err = wl_cfg_ioctl(wl, WLC_GET_SSID, &s, sizeof(s));
+
+	if (err)
+		return err;
+	*len = min_t(uint32, s.SSID_len, sizeof(s.SSID));
+	memcpy(ssid, s.SSID, *len);
+	return 0;
+}
+
 static void wl_free(struct wl_info *wl)
 {
 	if (wl->dev && wl->dev->reg_state == NETREG_REGISTERED)
 		unregister_netdev(wl->dev);
+	wl_cfg80211_detach(wl->cfg);
+	wl->cfg = NULL;
+	if (wl->dev)
+		wl->dev->ieee80211_ptr = NULL;
 	if (wl->irq_requested)
 		free_irq(wl->irq, wl);
 	tasklet_kill(&wl->tasklet);
@@ -619,7 +965,11 @@ static void *wl_attach(u16 vendor, u16 device, ulong regs, void *btparam, u32 ir
 	wlif->wl = wl;
 	wlif->dev = dev;
 	wl->wlif = wlif;
-	strlcpy(dev->name, "wl%d", IFNAMSIZ);
+#ifdef WL_CFG80211
+	strlcpy(dev->name, "wlan%d", IFNAMSIZ);	/* what OpenWrt's mac80211.sh expects */
+#else
+	strlcpy(dev->name, "wl%d", IFNAMSIZ);	/* what brcmwl.sh/wlc expect */
+#endif
 	dev->netdev_ops = &wl_netdev_ops;
 	dev->ethtool_ops = &wl_ethtool_ops;
 	dev->needed_headroom = WL_TXHEADROOM;
@@ -650,12 +1000,15 @@ static void *wl_attach(u16 vendor, u16 device, ulong regs, void *btparam, u32 ir
 	wl->irq_requested = TRUE;
 	dev->irq = irq;
 
+	wl->cfg = wl_cfg80211_attach(wl, dev, &core->dev);
 	if (register_netdev(dev)) {
 		pr_err("wl%d: register_netdev failed\n", unit);
 		goto fail;
 	}
 	pr_info("%s: Broadcom BCM%04x 802.11 Wireless Controller %s, MAC %pM\n",
 		dev->name, device, EPI_VERSION_STR, dev->dev_addr);
+	if (wl->cfg)
+		pr_info("%s: registered with cfg80211 as %s\n", dev->name, wl_cfg80211_name(wl->cfg));
 	wl_found++;
 	return wl;
 fail:
@@ -669,8 +1022,12 @@ static void wl_remove(void *wldev)
 
 	if (!wl)
 		return;
-	if (wl->dev && netif_running(wl->dev))
-		dev_close(wl->dev);
+	if (wl->dev) {
+		rtnl_lock();		/* dev_close() needs RTNL */
+		if (netif_running(wl->dev))
+			dev_close(wl->dev);
+		rtnl_unlock();
+	}
 	WL_LOCK(wl);
 	if (wl->pub && PUB_UP(wl->pub))
 		wl_down(wl);
