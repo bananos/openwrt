@@ -34,6 +34,7 @@
  * OF THIS SOFTWARE.
  */
 #include <linux/kernel.h>
+#include <linux/ctype.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/slab.h>
@@ -95,6 +96,9 @@ struct wl_cfg {
 	spinlock_t evlock;
 	struct list_head evq;
 	struct work_struct evwork;
+	/* the regulatory country to hand to the core (reg_notifier -> regwork) */
+	char reg_alpha2[2];
+	struct work_struct regwork;
 	bool dying;
 };
 
@@ -136,9 +140,10 @@ static const struct ieee80211_sta_ht_cap wl_cfg_ht_cap = {
 };
 
 /*
- * The core enforces its own country rules (it reports country XU, channels 1-13) and power limits,
- * so cfg80211 gets one permissive custom rule and the channels the core doesn't allow are disabled.
- * Without this, cfg80211's world domain would mark channels 12-13 no-IR.
+ * The core enforces its own country rules (by default country XU, channels 1-13) and power limits,
+ * so cfg80211 starts from one permissive custom rule and the channels the core doesn't allow are
+ * disabled. Without this, cfg80211's world domain would mark channels 12-13 no-IR. A country set
+ * later goes to the core too (wl_cfg_reg_notifier).
  */
 static const struct ieee80211_regdomain wl_cfg_regd = {
 	.n_reg_rules = 1,
@@ -1290,6 +1295,60 @@ void wl_cfg80211_event(struct wl_cfg *cfg, struct wl_if *ifp, const struct wl_cf
 	}
 }
 
+/* ------------------------------------------------------------------ regulatory */
+
+/*
+ * The core has its own country tables: channels, power limits per rate and band edge, and the
+ * Country element it puts in its beacons. cfg80211's country (iw reg set, hostapd's country_code,
+ * the AP a STA connects to) is handed to it; the world domain becomes the core's "XU". cfg80211 goes
+ * on applying the regulatory database to the channel list, and a channel the core does not allow
+ * in that country is disabled on top. The notifier only queues: it runs inside cfg80211's
+ * regulatory processing, the core calls sleep.
+ */
+static void wl_cfg_reg_notifier(struct wiphy *wiphy, struct regulatory_request *req)
+{
+	struct wl_cfg *cfg = wl_cfg_of(wiphy);
+	unsigned long flags;
+
+	spin_lock_irqsave(&cfg->evlock, flags);
+	if (!cfg->dying) {
+		memcpy(cfg->reg_alpha2, req->alpha2, 2);
+		schedule_work(&cfg->regwork);
+	}
+	spin_unlock_irqrestore(&cfg->evlock, flags);
+}
+
+static void wl_cfg_regwork(struct work_struct *work)
+{
+	struct wl_cfg *cfg = container_of(work, struct wl_cfg, regwork);
+	char cc[3] = { cfg->reg_alpha2[0], cfg->reg_alpha2[1], 0 };
+	u32 valid[32];
+	int i, j, n, err;
+
+	if (!isalpha(cc[0]) || !isalpha(cc[1]))	/* "00" world, "98"/"99" intersected/custom */
+		strcpy(cc, "XU");
+	rtnl_lock();
+	if (cfg->dying)
+		goto out;
+	err = wl_cfg_set_country(cfg->bss[0], cc);
+	n = wl_cfg_valid_channels(cfg->bss[0], valid, ARRAY_SIZE(valid));
+	for (i = 0; n > 0 && i < cfg->band.n_channels; i++) {
+		struct ieee80211_channel *ch = &cfg->band.channels[i];
+
+		for (j = 0; j < n && valid[j] != ch->hw_value; j++)
+			;
+		if (j == n)
+			ch->flags |= IEEE80211_CHAN_DISABLED;
+	}
+	if (err)
+		wiphy_warn(cfg->wiphy, "country %s is not in the core's tables, it keeps its previous one\n",
+			   cc);
+	else
+		wiphy_info(cfg->wiphy, "country %s: %d channels\n", cc, n);
+out:
+	rtnl_unlock();
+}
+
 /* ------------------------------------------------------------------ attach / detach */
 
 static void wl_cfg_setup_band(struct wl_cfg *cfg, struct ieee80211_channel *chans)
@@ -1335,6 +1394,7 @@ struct wl_cfg *wl_cfg80211_attach(struct wl_info *wl, struct net_device *dev, st
 	spin_lock_init(&cfg->evlock);
 	INIT_LIST_HEAD(&cfg->evq);
 	INIT_WORK(&cfg->evwork, wl_cfg_evwork);
+	INIT_WORK(&cfg->regwork, wl_cfg_regwork);
 	chans = (struct ieee80211_channel *)(cfg + 1);
 	wl_cfg_setup_band(cfg, chans);
 
@@ -1356,6 +1416,7 @@ struct wl_cfg *wl_cfg80211_attach(struct wl_info *wl, struct net_device *dev, st
 	wiphy->rts_threshold = 2347;
 	wiphy->frag_threshold = 2346;
 	wiphy->regulatory_flags = REGULATORY_CUSTOM_REG | REGULATORY_DISABLE_BEACON_HINTS;
+	wiphy->reg_notifier = wl_cfg_reg_notifier;
 	wiphy_apply_custom_regulatory(wiphy, &wl_cfg_regd);
 	/* AP: association and probe responses happen in the core; hostapd only does WPA and keys */
 	wiphy->flags |= WIPHY_FLAG_HAVE_AP_SME;

@@ -1098,6 +1098,17 @@ int wl_cfg_valid_channels(struct wl_if *ifp, u32 *chans, int max)
 	return n;
 }
 
+int wl_cfg_set_country(struct wl_if *ifp, const char *cc)
+{
+	wl_country_t c;
+
+	memset(&c, 0, sizeof(c));
+	memcpy(c.country_abbrev, cc, 2);
+	memcpy(c.ccode, cc, 2);
+	c.rev = -1;			/* the core's default revision for the code */
+	return wl_cfg_iovar(ifp, "country", NULL, 0, &c, sizeof(c), TRUE) ? -EINVAL : 0;
+}
+
 int wl_cfg_assoclist(struct wl_if *ifp, u8 (*macs)[6], int max)
 {
 	int i, n, err, len = sizeof(uint) + max * ETHER_ADDR_LEN;

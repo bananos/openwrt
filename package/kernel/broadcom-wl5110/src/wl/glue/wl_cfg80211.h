@@ -144,6 +144,8 @@ int wl_cfg_valid_channels(struct wl_if *ifp, u32 *chans, int max);	/* returns co
 int wl_cfg_assoclist(struct wl_if *ifp, u8 (*macs)[6], int max);	/* returns count */
 int wl_cfg_sta_info(struct wl_if *ifp, const u8 *mac, struct wl_cfg_sta *st);
 int wl_cfg_noise(struct wl_if *ifp, int *dbm);
+/* the core's country (its channel list, power limits and Country element); -EINVAL if unknown */
+int wl_cfg_set_country(struct wl_if *ifp, const char *cc);
 int wl_cfg_board_maxpower(struct wl_if *ifp, int *qdbm);	/* maxp2ga0/1, quarter-dBm */
 
 int wl_cfg_start_ap(struct wl_if *ifp, const struct wl_cfg_ap *ap);
