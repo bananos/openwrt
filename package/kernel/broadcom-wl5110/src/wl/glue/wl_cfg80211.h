@@ -157,6 +157,11 @@ int wl_cfg_del_key(struct wl_if *ifp, int idx, const u8 *mac);
 int wl_cfg_key_seq(struct wl_if *ifp, int idx, u8 seq[6]);
 int wl_cfg_authorize(struct wl_if *ifp, const u8 *mac, bool authorized);
 int wl_cfg_deauth(struct wl_if *ifp, const u8 *mac, int reason);
+/* the AP's MAC filter: mode WL_CFG_ACL_*, n addresses (the core's maclist/macmode) */
+#define WL_CFG_ACL_OFF		0
+#define WL_CFG_ACL_DENY		1	/* deny the listed stations */
+#define WL_CFG_ACL_ALLOW	2	/* allow only the listed stations */
+int wl_cfg_set_acl(struct wl_if *ifp, int mode, const u8 (*macs)[6], int n);
 
 /* station side */
 int wl_cfg_join(struct wl_if *ifp, const struct wl_cfg_join *j);

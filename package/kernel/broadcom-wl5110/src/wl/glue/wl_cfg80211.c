@@ -45,6 +45,7 @@
 #include "wl_cfg80211.h"
 
 #define WL_CFG_MAX_STA		32
+#define WL_CFG_MAX_ACL		64	/* MAC filter entries, as the stock wl tool's maclist */
 #define WL_QDBM_NO_LIMIT	127	/* qtxpower: no user limit set, real power is board-limited */
 /*
  * Interfaces: one STA (on the primary bsscfg) and up to three APs (bsscfgs 1-3), the core's MBSS
@@ -497,6 +498,8 @@ static int wl_cfg_key_cipher(u32 suite, enum wl_cfg_cipher *c)
 
 /* ------------------------------------------------------------------ AP: hostapd */
 
+static int wl_cfg_apply_acl(struct wl_cfg_vif *vif, const struct cfg80211_acl_data *acl);
+
 static int wl_cfg_start_ap_op(struct wiphy *wiphy, struct net_device *dev,
 			      struct cfg80211_ap_settings *s)
 {
@@ -525,11 +528,63 @@ static int wl_cfg_start_ap_op(struct wiphy *wiphy, struct net_device *dev,
 	ap.set_radio = !(sta && (sta->connected || sta->connecting)) && !wl_cfg_ap_running(vif->cfg);
 	err = wl_cfg_start_ap(vif->ifp, &ap);
 	vif->ap_started = !err;
+	if (!err && s->acl)
+		err = wl_cfg_apply_acl(vif, s->acl);
 	netdev_info(dev, "start_ap: channel %d%s%s wsec 0x%x auth 0x%x: %d\n", ap.channel,
 		    ap.center_channel ? (ap.center_channel > ap.channel ? " HT40+" : " HT40-") : "",
 		    ap.set_radio ? "" : sta && (sta->connected || sta->connecting) ?
 		    " (radio follows the STA)" : " (radio already set)", ap.wsec, ap.auth, err);
 	return err;
+}
+
+/*
+ * MAC filter (hostapd's macaddr_acl with accept/deny lists, LuCI's "MAC-Filter"). The core does the
+ * association itself, so hostapd hands its list to the driver (ACL offload) and the core's maclist
+ * enforces it on (re)association. Stations already associated that the new list excludes are
+ * deauthenticated, as hostapd would do itself; the core's DEAUTH event then removes them from
+ * cfg80211. The core keeps one list per BSS.
+ *
+ * Limitation: hostapd (2.9 to 2.11 at least) offloads only its first BSS's list, once per radio
+ * (hostapd_set_acl() on iface->bss[0]), and does not check the lists itself for associations the
+ * driver reports. So only the first SSID of the radio is filtered: list the SSID that needs a
+ * filter first in /etc/config/wireless.
+ */
+static int wl_cfg_apply_acl(struct wl_cfg_vif *vif, const struct cfg80211_acl_data *acl)
+{
+	u8 (*macs)[ETH_ALEN], sta[WL_CFG_MAX_STA][ETH_ALEN];
+	int i, j, n = acl ? acl->n_acl_entries : 0, mode, nsta, err;
+
+	if (n > WL_CFG_MAX_ACL)
+		return -EINVAL;
+	mode = !acl ? WL_CFG_ACL_OFF : acl->acl_policy == NL80211_ACL_POLICY_DENY_UNLESS_LISTED ?
+	       WL_CFG_ACL_ALLOW : n ? WL_CFG_ACL_DENY : WL_CFG_ACL_OFF;
+	macs = kcalloc(max(n, 1), ETH_ALEN, GFP_KERNEL);
+	if (!macs)
+		return -ENOMEM;
+	for (i = 0; i < n; i++)
+		memcpy(macs[i], acl->mac_addrs[i].addr, ETH_ALEN);
+	err = wl_cfg_set_acl(vif->ifp, mode, (const u8 (*)[6])macs, n);
+	if (!err && mode != WL_CFG_ACL_OFF) {
+		nsta = wl_cfg_assoclist(vif->ifp, sta, WL_CFG_MAX_STA);
+		for (i = 0; i < nsta; i++) {
+			for (j = 0; j < n && !ether_addr_equal(sta[i], macs[j]); j++)
+				;
+			if ((j < n) == (mode == WL_CFG_ACL_DENY))
+				wl_cfg_deauth(vif->ifp, sta[i], WLAN_REASON_UNSPECIFIED);
+		}
+	}
+	kfree(macs);
+	if (vif->wdev.netdev)
+		netdev_info(vif->wdev.netdev, "MAC filter: %s, %d address%s: %d\n",
+			    mode == WL_CFG_ACL_ALLOW ? "allow listed" : mode == WL_CFG_ACL_DENY ?
+			    "deny listed" : "off", n, n == 1 ? "" : "es", err);
+	return err;
+}
+
+static int wl_cfg_set_mac_acl(struct wiphy *wiphy, struct net_device *dev,
+			      const struct cfg80211_acl_data *acl)
+{
+	return wl_cfg_apply_acl(wl_vif_of_dev(dev), acl);
 }
 
 static int wl_cfg_change_beacon(struct wiphy *wiphy, struct net_device *dev,
@@ -1163,6 +1218,7 @@ static const struct cfg80211_ops wl_cfg_ops = {
 	.start_ap		= wl_cfg_start_ap_op,
 	.change_beacon		= wl_cfg_change_beacon,
 	.stop_ap		= wl_cfg_stop_ap_op,
+	.set_mac_acl		= wl_cfg_set_mac_acl,
 	.add_key		= wl_cfg_add_key_op,
 	.del_key		= wl_cfg_del_key_op,
 	.get_key		= wl_cfg_get_key_op,
@@ -1423,6 +1479,7 @@ struct wl_cfg *wl_cfg80211_attach(struct wl_info *wl, struct net_device *dev, st
 	wiphy->probe_resp_offload = NL80211_PROBE_RESP_OFFLOAD_SUPPORT_WPS |
 				    NL80211_PROBE_RESP_OFFLOAD_SUPPORT_WPS2;
 	wiphy->features |= NL80211_FEATURE_INACTIVITY_TIMER;	/* scb_activity_time */
+	wiphy->max_acl_mac_addrs = WL_CFG_MAX_ACL;		/* MAC filter offload */
 	wiphy->mgmt_stypes = wl_cfg_mgmt_stypes;
 	/* STA: the core's supplicant does the 4-way handshake with the PSK from connect */
 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_4WAY_HANDSHAKE_STA_PSK);

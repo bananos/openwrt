@@ -1109,6 +1109,20 @@ int wl_cfg_set_country(struct wl_if *ifp, const char *cc)
 	return wl_cfg_iovar(ifp, "country", NULL, 0, &c, sizeof(c), TRUE) ? -EINVAL : 0;
 }
 
+int wl_cfg_set_acl(struct wl_if *ifp, int mode, const u8 (*macs)[6], int n)
+{
+	int len = sizeof(uint) + max(n, 1) * ETHER_ADDR_LEN, err;
+	struct maclist *ml = kzalloc(len, GFP_KERNEL);
+
+	if (!ml)
+		return -ENOMEM;
+	ml->count = n;
+	memcpy(ml->ea, macs, n * ETHER_ADDR_LEN);
+	err = wl_cfg_ioctl(ifp, WLC_SET_MACLIST, ml, len);
+	kfree(ml);
+	return err ?: wl_cfg_setint(ifp, WLC_SET_MACMODE, mode);
+}
+
 int wl_cfg_assoclist(struct wl_if *ifp, u8 (*macs)[6], int max)
 {
 	int i, n, err, len = sizeof(uint) + max * ETHER_ADDR_LEN;
