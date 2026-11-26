@@ -294,7 +294,8 @@ static int wl_cfg_set_tx_power(struct wiphy *wiphy, struct wireless_dev *wdev,
 			return -EINVAL;
 		qdbm = min(mbm * 4 / 100, WL_QDBM_NO_LIMIT);
 	}
-	return wl_cfg_iovar_setint(wl_cfg_pri(wiphy), "qtxpower", qdbm);
+	/* the core applies a new limit when the radio comes up (measured: no change until then) */
+	return wl_cfg_radio_setint(wl_cfg_of(wiphy)->wl, "qtxpower", qdbm, true);
 }
 
 static int wl_cfg_set_wiphy_params(struct wiphy *wiphy, u32 changed)
@@ -518,6 +519,7 @@ static int wl_cfg_start_ap_op(struct wiphy *wiphy, struct net_device *dev,
 	if (!s->chandef.chan)
 		return -EINVAL;
 	ap.channel = s->chandef.chan->hw_value;
+	ap.ht = s->chandef.width != NL80211_CHAN_WIDTH_20_NOHT;	/* LuCI's "Legacy" mode: no HT */
 	if (s->chandef.width == NL80211_CHAN_WIDTH_40)
 		ap.center_channel = ieee80211_frequency_to_channel(s->chandef.center_freq1);
 	err = wl_cfg_crypto(&s->crypto, s->privacy, &ap.wsec, &ap.auth);
@@ -833,6 +835,9 @@ static int wl_cfg_connect(struct wiphy *wiphy, struct net_device *dev,
 
 	if (vif->wdev.iftype != NL80211_IFTYPE_STATION)
 		return -EOPNOTSUPP;
+	/* an earlier legacy-mode AP may have left 802.11n off; with an AP running it decides */
+	if (!wl_cfg_ap_running(vif->cfg))
+		wl_cfg_radio_setint(vif->cfg->wl, "nmode", 1, true);
 	err = wl_cfg_crypto(&sme->crypto, sme->privacy, &j.wsec, &j.auth);
 	if (err)
 		return err;
@@ -1095,6 +1100,14 @@ static struct wireless_dev *wl_cfg_add_virtual_intf(struct wiphy *wiphy, const c
 	     wl_cfg_n_of_type(cfg, type) >= WL_CFG_MAX_AP))
 		return ERR_PTR(-EBUSY);
 	err = wl_cfg_prepare(cfg);
+	/*
+	 * The first interface: the TX power limit goes back to none, as on mac80211, where it is per
+	 * interface. mac80211.sh sets a configured one again after creating the interfaces, and none
+	 * for LuCI's "driver default"; the core keeps its limit radio-wide otherwise.
+	 */
+	if (!err && !wl_cfg_n_of_type(cfg, NL80211_IFTYPE_STATION) &&
+	    !wl_cfg_n_of_type(cfg, NL80211_IFTYPE_AP))
+		wl_cfg_radio_setint(cfg->wl, "qtxpower", WL_QDBM_NO_LIMIT, false);
 	wl_cfg_mac_for(cfg, type, mac);
 	err = err ?: wl_cfg_bss_for(cfg, type, mac, &ifp);
 	if (err) {

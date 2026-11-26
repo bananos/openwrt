@@ -50,6 +50,7 @@ struct wl_cfg_ap {
 	int channel;		/* control channel (used if set_radio) */
 	int center_channel;	/* 40 MHz: centre of the pair (channel +/- 2); 0 = 20 MHz */
 	bool set_radio;		/* set the radio's channel; not while a STA (repeater) decides it */
+	bool ht;		/* 802.11n (with set_radio): off for hostapd's legacy mode */
 	int beacon_int;		/* TU, 0 = leave */
 	int dtim;		/* 0 = leave */
 	bool hidden;
@@ -137,6 +138,12 @@ int wl_cfg_set_mode(struct wl_info *wl, bool primary_sta, bool apsta);
 int wl_cfg_ioctl(struct wl_if *ifp, int cmd, void *buf, int len);
 int wl_cfg_iovar_getint(struct wl_if *ifp, const char *name, int *val);
 int wl_cfg_iovar_setint(struct wl_if *ifp, const char *name, int val);
+/*
+ * A radio-wide int iovar: nothing if it already has the value, else set (with the radio down and up
+ * around it if the core does not take it while up); cycle: bring the radio down and up afterwards
+ * too, for settings the core applies only when it comes up (qtxpower).
+ */
+int wl_cfg_radio_setint(struct wl_info *wl, const char *name, int val, bool cycle);
 int wl_cfg_channel(struct wl_if *ifp, int *chan);
 /* current chanspec: control and centre channel, width in MHz (20 or 40) */
 int wl_cfg_chanspec(struct wl_if *ifp, int *ctl, int *center, int *width);

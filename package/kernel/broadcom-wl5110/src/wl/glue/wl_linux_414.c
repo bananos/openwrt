@@ -1041,6 +1041,28 @@ int wl_cfg_iovar_setint(struct wl_if *ifp, const char *name, int val)
 	return wl_cfg_iovar(ifp, name, NULL, 0, &val, sizeof(val), TRUE);
 }
 
+int wl_cfg_radio_setint(struct wl_info *wl, const char *name, int val, bool cycle)
+{
+	struct wl_if *pri = wl->wlif;
+	int cur, err, e;
+
+	if (!wl_cfg_iovar_getint(pri, name, &cur) && cur == val)
+		return 0;
+	err = wl_cfg_iovar_setint(pri, name, val);
+	if (!err && !(cycle && wl->n_open))
+		return 0;
+	if (trace_ioctl)
+		pr_info("wl: radio down/up for %s %d\n", name, val);
+	e = wl_cfg_ioctl(pri, WLC_DOWN, NULL, 0);
+	if (err)
+		err = wl_cfg_iovar_setint(pri, name, val);
+	if (nompc)
+		wl_cfg_iovar_setint(pri, "mpc", 0);
+	if (wl->n_open)
+		e = e ?: wl_cfg_ioctl(pri, WLC_UP, NULL, 0);
+	return err ?: e;
+}
+
 static int wl_cfg_setint(struct wl_if *ifp, int cmd, int val)
 {
 	return wl_cfg_ioctl(ifp, cmd, &val, sizeof(val));
@@ -1281,6 +1303,14 @@ static int wl_cfg_radio_chan(struct wl_info *wl, const struct wl_cfg_ap *ap)
 	int cs = wl_cfg_mk_chanspec(ap->channel, ap->center_channel);
 	int err;
 
+	/*
+	 * 802.11n on or off (hostapd's legacy mode), before the chanspec: a 40 MHz one needs it. The
+	 * core rebuilds its rate sets only when the radio comes up (measured: back to N with the radio
+	 * up, stations still got legacy rates), so cycle it; this BSS is down at this point anyway.
+	 */
+	err = wl_cfg_radio_setint(wl, "nmode", ap->ht ? 1 : 0, true);
+	if (err)
+		pr_warn("wl: cannot set nmode %d: %d\n", ap->ht, err);
 	err = wl_cfg_iovar_setint(pri, "mimo_bw_cap", bw);
 	err = err ?: wl_cfg_iovar_setint(pri, "chanspec", cs);
 	if (!err && ap->beacon_int && wl_cfg_setint(pri, WLC_SET_BCNPRD, ap->beacon_int))
