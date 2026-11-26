@@ -102,18 +102,18 @@ static struct ieee80211_rate wl_cfg_rates[] = {
 };
 
 /*
- * BCM5357C0: 2x2 802.11n. The chip can do 40 MHz, but start_ap does not set the core's bandwidth
- * yet, and hostapd needs a 20/40 coexistence scan before it uses HT40. So only 20 MHz is
- * advertised; otherwise LuCI offers HT40 and hostapd then fails to start.
+ * BCM5357C0: 2x2 802.11n, 20/40 MHz. start_ap sets the core's chanspec from hostapd's channel
+ * definition; hostapd's 20/40 coexistence scan uses the scan op below.
  */
 static const struct ieee80211_sta_ht_cap wl_cfg_ht_cap = {
 	.ht_supported = true,
-	.cap = IEEE80211_HT_CAP_SGI_20,
+	.cap = IEEE80211_HT_CAP_SUP_WIDTH_20_40 | IEEE80211_HT_CAP_SGI_20 |
+	       IEEE80211_HT_CAP_SGI_40 | IEEE80211_HT_CAP_DSSSCCK40,
 	.ampdu_factor = IEEE80211_HT_MAX_AMPDU_64K,
 	.ampdu_density = IEEE80211_HT_MPDU_DENSITY_8,
 	.mcs = {
 		.rx_mask = { 0xff, 0xff },
-		.rx_highest = cpu_to_le16(144),
+		.rx_highest = cpu_to_le16(300),
 		.tx_params = IEEE80211_HT_MCS_TX_DEFINED,
 	},
 };
@@ -192,14 +192,16 @@ static int wl_cfg_get_channel(struct wiphy *wiphy, struct wireless_dev *wdev,
 			      struct cfg80211_chan_def *chandef)
 {
 	struct ieee80211_channel *chan;
-	int ch, err = wl_cfg_channel(wl_cfg_pri(wiphy), &ch);
+	int ctl, center, width, err = wl_cfg_chanspec(wl_cfg_pri(wiphy), &ctl, &center, &width);
 
 	if (err)
 		return err;
-	chan = ieee80211_get_channel(wiphy, ieee80211_channel_to_frequency(ch, NL80211_BAND_2GHZ));
+	chan = ieee80211_get_channel(wiphy, ieee80211_channel_to_frequency(ctl, NL80211_BAND_2GHZ));
 	if (!chan)
 		return -EINVAL;
-	cfg80211_chandef_create(chandef, chan, NL80211_CHAN_HT20);
+	cfg80211_chandef_create(chandef, chan, width == 40 ?
+				(ctl < center ? NL80211_CHAN_HT40PLUS : NL80211_CHAN_HT40MINUS) :
+				NL80211_CHAN_HT20);
 	return 0;
 }
 
@@ -432,12 +434,15 @@ static int wl_cfg_start_ap_op(struct wiphy *wiphy, struct net_device *dev,
 	if (!s->chandef.chan)
 		return -EINVAL;
 	ap.channel = s->chandef.chan->hw_value;
+	if (s->chandef.width == NL80211_CHAN_WIDTH_40)
+		ap.center_channel = ieee80211_frequency_to_channel(s->chandef.center_freq1);
 	err = wl_cfg_crypto(&s->crypto, s->privacy, &ap.wsec, &ap.auth);
 	if (err)
 		return err;
 	err = wl_cfg_start_ap(vif->ifp, &ap);
-	netdev_info(dev, "start_ap (bss %d): ssid '%.*s' channel %d wsec 0x%x auth 0x%x: %d\n",
-		    vif->idx, ap.ssid_len, ap.ssid, ap.channel, ap.wsec, ap.auth, err);
+	netdev_info(dev, "start_ap (bss %d): channel %d%s wsec 0x%x auth 0x%x: %d\n", vif->idx,
+		    ap.channel, ap.center_channel ? (ap.center_channel > ap.channel ? " HT40+" : " HT40-") :
+		    "", ap.wsec, ap.auth, err);
 	return err;
 }
 

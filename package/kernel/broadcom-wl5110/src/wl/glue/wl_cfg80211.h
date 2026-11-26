@@ -47,7 +47,8 @@ struct wl_cfg_sta {
 #define WL_CFG_AUTH_WPA2_8021X	0x8
 
 struct wl_cfg_ap {
-	int channel;		/* ignored on a secondary BSS: the radio follows the STA */
+	int channel;		/* control channel; ignored on a secondary BSS: the radio follows the STA */
+	int center_channel;	/* 40 MHz: centre of the pair (channel +/- 2); 0 = 20 MHz */
 	int beacon_int;		/* TU, 0 = leave */
 	int dtim;		/* 0 = leave */
 	bool hidden;
@@ -132,6 +133,8 @@ int wl_cfg_ioctl(struct wl_if *ifp, int cmd, void *buf, int len);
 int wl_cfg_iovar_getint(struct wl_if *ifp, const char *name, int *val);
 int wl_cfg_iovar_setint(struct wl_if *ifp, const char *name, int val);
 int wl_cfg_channel(struct wl_if *ifp, int *chan);
+/* current chanspec: control and centre channel, width in MHz (20 or 40) */
+int wl_cfg_chanspec(struct wl_if *ifp, int *ctl, int *center, int *width);
 int wl_cfg_valid_channels(struct wl_if *ifp, u32 *chans, int max);	/* returns count */
 int wl_cfg_assoclist(struct wl_if *ifp, u8 (*macs)[6], int max);	/* returns count */
 int wl_cfg_sta_info(struct wl_if *ifp, const u8 *mac, struct wl_cfg_sta *st);

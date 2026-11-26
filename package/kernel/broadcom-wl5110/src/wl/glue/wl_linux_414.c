@@ -971,6 +971,33 @@ int wl_cfg_channel(struct wl_if *ifp, int *chan)
 	return err;
 }
 
+int wl_cfg_chanspec(struct wl_if *ifp, int *ctl, int *center, int *width)
+{
+	int cs, err = wl_cfg_iovar_getint(ifp, "chanspec", &cs);
+
+	if (err)
+		return err;
+	*center = cs & WL_CHANSPEC_CHAN_MASK;
+	if ((cs & WL_CHANSPEC_BW_MASK) == WL_CHANSPEC_BW_40) {
+		*width = 40;
+		*ctl = (cs & WL_CHANSPEC_CTL_SB_MASK) == WL_CHANSPEC_CTL_SB_LOWER ? *center - 2
+										      : *center + 2;
+	} else {
+		*width = 20;
+		*ctl = *center;
+	}
+	return 0;
+}
+
+/* 2.4 GHz chanspec for a 20 MHz channel, or a 40 MHz pair given by its control and centre channel */
+static int wl_cfg_mk_chanspec(int ctl, int center)
+{
+	if (!center)
+		return WL_CHANSPEC_BAND_2G | WL_CHANSPEC_BW_20 | WL_CHANSPEC_CTL_SB_NONE | ctl;
+	return WL_CHANSPEC_BAND_2G | WL_CHANSPEC_BW_40 | center |
+	       (ctl < center ? WL_CHANSPEC_CTL_SB_LOWER : WL_CHANSPEC_CTL_SB_UPPER);
+}
+
 int wl_cfg_valid_channels(struct wl_if *ifp, u32 *chans, int max)
 {
 	uint buf[1 + 64];	/* wl_uint32_list_t */
@@ -1110,6 +1137,9 @@ int wl_cfg_set_mode(struct wl_info *wl, bool primary_sta, bool apsta)
 		err = err ?: wl_cfg_setint(ifp, WLC_SET_AP, !primary_sta);
 	}
 	err = err ?: wl_cfg_setint(ifp, WLC_SET_INFRA, 1);
+	/* a STA (and an AP next to it) may join a 40 MHz BSS; a lone AP sets its own in start_ap */
+	if (!err && primary_sta)
+		err = wl_cfg_iovar_setint(ifp, "mimo_bw_cap", 1);
 	if (!err && nompc)		/* the mode change set it back to 1 */
 		err = wl_cfg_iovar_setint(ifp, "mpc", 0);
 	err = err ?: wl_cfg_enable_events(wl);
@@ -1152,7 +1182,13 @@ int wl_cfg_start_ap(struct wl_if *ifp, const struct wl_cfg_ap *ap)
 		err = err ?: wl_cfg_iovar_setint(ifp, "apsta", 0);
 		err = err ?: wl_cfg_setint(ifp, WLC_SET_AP, 1);
 		err = err ?: wl_cfg_setint(ifp, WLC_SET_INFRA, 1);
-		err = err ?: wl_cfg_setint(ifp, WLC_SET_CHANNEL, ap->channel);
+		/*
+		 * Bandwidth: mimo_bw_cap 1 allows 40 MHz on 2.4 GHz (the default, 2, only on 5 GHz), and
+		 * the chanspec picks the pair. hostapd has already done the 20/40 coexistence scan.
+		 */
+		err = err ?: wl_cfg_iovar_setint(ifp, "mimo_bw_cap", ap->center_channel ? 1 : 0);
+		err = err ?: wl_cfg_iovar_setint(ifp, "chanspec",
+						 wl_cfg_mk_chanspec(ap->channel, ap->center_channel));
 		if (!err && ap->beacon_int)
 			err = wl_cfg_setint(ifp, WLC_SET_BCNPRD, ap->beacon_int);
 		if (!err && ap->dtim)
