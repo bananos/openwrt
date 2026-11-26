@@ -2,10 +2,12 @@
 /*
  * cfg80211 front end for the Broadcom wl 5.110 core (experimental, Phase D).
  *
- * The radio is one wiphy with up to two interfaces (vifs), each one BSS of the core:
- *  - vif 0, the core's primary bsscfg: an AP, or a STA;
- *  - vif 1, a secondary bsscfg created on demand: an AP next to a STA on vif 0 (AP+STA, "repeater";
- *    the core's apsta mode). It shares the radio, so it runs on the STA's channel.
+ * The radio is one wiphy with up to two interfaces (vifs): one STA and one AP. The core runs in its
+ * AP+STA mode (apsta) from the first interface on, and each type has its own BSS of the core:
+ *  - a STA is the primary bsscfg (0);
+ *  - an AP is bsscfg 1, also when it is alone: next to an idle STA. In AP-only mode the core never
+ *    finishes a scan; this way hostapd (ACS, 20/40 coexistence) and iw/LuCI can scan while the AP
+ *    runs. With a STA connected (repeater) the AP runs on the STA's channel.
  * Net_devices are created and destroyed with the interfaces (add/del_virtual_intf), so OpenWrt's
  * mac80211.sh can name them as it likes (wlan0, wlan0-1, ...).
  *
@@ -43,20 +45,28 @@
 
 #define WL_CFG_MAX_STA		32
 #define WL_QDBM_NO_LIMIT	127	/* qtxpower: no user limit set, real power is board-limited */
-#define WL_CFG_NVIF		2
+/*
+ * Interfaces: one STA (on the primary bsscfg) and up to three APs (bsscfgs 1-3), the core's MBSS
+ * block of four addresses minus the one whose index is the primary's (see wl_cfg_vif_mac).
+ */
+#define WL_CFG_NVIF		4
+#define WL_CFG_NBSS		4
+#define WL_CFG_NADDR		3
+#define WL_CFG_MAX_AP		3
 
 struct wl_cfg;
 
 struct wl_cfg_vif {
 	struct wl_cfg *cfg;
-	struct wl_if *ifp;		/* the core BSS; vif 1's is allocated on first use */
+	struct wl_if *ifp;		/* the core BSS: cfg->bss[0] for a STA, cfg->bss[1] for an AP */
 	struct wireless_dev wdev;
 	int idx;
 	bool in_use;			/* handed out by add_virtual_intf */
 	/* AP */
 	u8 sta_macs[WL_CFG_MAX_STA][ETH_ALEN];	/* dump_station snapshot, taken at idx 0 */
 	int n_sta;
-	/* STA (vif 0 only) */
+	bool ap_started;
+	/* STA */
 	bool connecting, connected, keyed, psk_offload;
 	u8 bssid[ETH_ALEN];
 };
@@ -70,10 +80,17 @@ struct wl_cfg_qev {
 struct wl_cfg {
 	struct wl_info *wl;
 	struct wiphy *wiphy;
-	struct mac_address addrs[WL_CFG_NVIF];	/* wiphy->addresses */
+	u8 hw_mac[ETH_ALEN];			/* the radio's own MAC (the idle STA's) */
+	struct mac_address addrs[WL_CFG_NADDR];	/* wiphy->addresses */
+	struct wl_if *bss[WL_CFG_NBSS];		/* the core's bsscfgs: 0 primary (STA), 1-3 APs */
+	bool apsta;				/* the core is in apsta mode, bsscfg 1 exists */
 	struct wl_cfg_vif vif[WL_CFG_NVIF];
 	struct ieee80211_supported_band band;	/* per device: channels get disabled per country */
 	struct cfg80211_scan_request *scan_req;
+	/* per-channel load estimate from the last scan (index = channel number), see dump_survey */
+	u32 load[15];
+#define WL_CFG_LOAD_FULL	1000	/* load of one strong BSS on the channel itself */
+	bool load_valid;
 	/* core events that need process context (STA, scan), handled in order under RTNL */
 	spinlock_t evlock;
 	struct list_head evq;
@@ -134,18 +151,22 @@ static const u32 wl_cfg_ciphers[] = {
 	WLAN_CIPHER_SUITE_TKIP, WLAN_CIPHER_SUITE_CCMP,
 };
 
-/* one STA plus one AP on the same channel (the core's apsta), or either alone */
+/*
+ * One STA and APs on the same channel (the core's apsta): three addresses, so three APs, or a STA and
+ * two APs. All APs share the radio's beacon interval.
+ */
 static const struct ieee80211_iface_limit wl_cfg_limits[] = {
 	{ .max = 1, .types = BIT(NL80211_IFTYPE_STATION) },
-	{ .max = 1, .types = BIT(NL80211_IFTYPE_AP) },
+	{ .max = WL_CFG_MAX_AP, .types = BIT(NL80211_IFTYPE_AP) },
 };
 
 static const struct ieee80211_iface_combination wl_cfg_combinations[] = {
 	{
 		.limits = wl_cfg_limits,
 		.n_limits = ARRAY_SIZE(wl_cfg_limits),
-		.max_interfaces = 2,
+		.max_interfaces = WL_CFG_NADDR,
 		.num_different_channels = 1,
+		.beacon_int_infra_match = true,
 	},
 };
 
@@ -166,9 +187,39 @@ static struct wl_cfg *wl_cfg_of(struct wiphy *wiphy)
 	return wiphy_priv(wiphy);
 }
 
+/* the primary bsscfg: radio-wide settings and scans */
 static struct wl_if *wl_cfg_pri(struct wiphy *wiphy)
 {
-	return wl_cfg_of(wiphy)->vif[0].ifp;
+	return wl_cfg_of(wiphy)->bss[0];
+}
+
+static struct wl_cfg_vif *wl_cfg_vif_of_type(struct wl_cfg *cfg, enum nl80211_iftype type)
+{
+	int i;
+
+	for (i = 0; i < WL_CFG_NVIF; i++)
+		if (cfg->vif[i].in_use && cfg->vif[i].wdev.iftype == type)
+			return &cfg->vif[i];
+	return NULL;
+}
+
+static int wl_cfg_n_of_type(struct wl_cfg *cfg, enum nl80211_iftype type)
+{
+	int i, n = 0;
+
+	for (i = 0; i < WL_CFG_NVIF; i++)
+		n += cfg->vif[i].in_use && cfg->vif[i].wdev.iftype == type;
+	return n;
+}
+
+static bool wl_cfg_ap_running(struct wl_cfg *cfg)
+{
+	int i;
+
+	for (i = 0; i < WL_CFG_NVIF; i++)
+		if (cfg->vif[i].in_use && cfg->vif[i].ap_started)
+			return true;
+	return false;
 }
 
 static struct wl_cfg_vif *wl_vif_of_wdev(struct wireless_dev *wdev)
@@ -257,19 +308,44 @@ static int wl_cfg_set_wiphy_params(struct wiphy *wiphy, u32 changed)
 static int wl_cfg_dump_survey(struct wiphy *wiphy, struct net_device *dev, int idx,
 			      struct survey_info *survey)
 {
+	struct wl_cfg *cfg = wl_cfg_of(wiphy);
 	struct wl_if *ifp = wl_cfg_pri(wiphy);
-	int ch, noise;
+	struct ieee80211_channel *chan;
+	int ch = 0, noise;
+	u32 l;
 
-	if (idx != 0 || wl_cfg_channel(ifp, &ch))
+	if (wl_cfg_channel(ifp, &ch))
+		ch = 0;
+	/* no scan yet: only the current channel, with the noise the core measures there */
+	if (!cfg->load_valid) {
+		if (idx != 0 || !ch)
+			return -ENOENT;
+		chan = ieee80211_get_channel(wiphy, ieee80211_channel_to_frequency(ch, NL80211_BAND_2GHZ));
+	} else {
+		if (idx >= cfg->band.n_channels)
+			return -ENOENT;
+		chan = &cfg->band.channels[idx];
+	}
+	if (!chan)
 		return -ENOENT;
-	survey->channel = ieee80211_get_channel(wiphy,
-					ieee80211_channel_to_frequency(ch, NL80211_BAND_2GHZ));
-	if (!survey->channel)
-		return -ENOENT;
-	survey->filled = SURVEY_INFO_IN_USE;
-	if (!wl_cfg_noise(ifp, &noise) && noise < 0) {
-		survey->filled |= SURVEY_INFO_NOISE_DBM;
-		survey->noise = noise;
+	survey->channel = chan;
+	survey->filled = 0;
+	if (chan->hw_value == ch)
+		survey->filled |= SURVEY_INFO_IN_USE;
+	/*
+	 * The core measures noise only where it is; ACS needs a noise floor on every channel, and
+	 * the same one everywhere leaves the ranking to the busy time.
+	 */
+	if (wl_cfg_noise(ifp, &noise) || noise >= 0)
+		noise = -92;
+	survey->filled |= SURVEY_INFO_NOISE_DBM;
+	survey->noise = noise;
+	if (cfg->load_valid) {
+		/* estimated, see wl_cfg_load_one: 1000 "ms" of channel time, busy saturating with load */
+		l = min_t(u32, cfg->load[chan->hw_value], 1000000);
+		survey->filled |= SURVEY_INFO_TIME | SURVEY_INFO_TIME_BUSY;
+		survey->time = WL_CFG_LOAD_FULL;
+		survey->time_busy = WL_CFG_LOAD_FULL * l / (l + WL_CFG_LOAD_FULL);
 	}
 	return 0;
 }
@@ -419,7 +495,7 @@ static int wl_cfg_key_cipher(u32 suite, enum wl_cfg_cipher *c)
 static int wl_cfg_start_ap_op(struct wiphy *wiphy, struct net_device *dev,
 			      struct cfg80211_ap_settings *s)
 {
-	struct wl_cfg_vif *vif = wl_vif_of_dev(dev);
+	struct wl_cfg_vif *vif = wl_vif_of_dev(dev), *sta;
 	struct wl_cfg_ap ap = {
 		.beacon_int = s->beacon_interval,
 		.dtim = s->dtim_period,
@@ -439,10 +515,15 @@ static int wl_cfg_start_ap_op(struct wiphy *wiphy, struct net_device *dev,
 	err = wl_cfg_crypto(&s->crypto, s->privacy, &ap.wsec, &ap.auth);
 	if (err)
 		return err;
+	/* the radio's channel: a connected STA decides it, else the first AP to start */
+	sta = wl_cfg_vif_of_type(vif->cfg, NL80211_IFTYPE_STATION);
+	ap.set_radio = !(sta && (sta->connected || sta->connecting)) && !wl_cfg_ap_running(vif->cfg);
 	err = wl_cfg_start_ap(vif->ifp, &ap);
-	netdev_info(dev, "start_ap (bss %d): channel %d%s wsec 0x%x auth 0x%x: %d\n", vif->idx,
-		    ap.channel, ap.center_channel ? (ap.center_channel > ap.channel ? " HT40+" : " HT40-") :
-		    "", ap.wsec, ap.auth, err);
+	vif->ap_started = !err;
+	netdev_info(dev, "start_ap: channel %d%s%s wsec 0x%x auth 0x%x: %d\n", ap.channel,
+		    ap.center_channel ? (ap.center_channel > ap.channel ? " HT40+" : " HT40-") : "",
+		    ap.set_radio ? "" : sta && (sta->connected || sta->connecting) ?
+		    " (radio follows the STA)" : " (radio already set)", ap.wsec, ap.auth, err);
 	return err;
 }
 
@@ -454,6 +535,7 @@ static int wl_cfg_change_beacon(struct wiphy *wiphy, struct net_device *dev,
 
 static int wl_cfg_stop_ap_op(struct wiphy *wiphy, struct net_device *dev)
 {
+	wl_vif_of_dev(dev)->ap_started = false;
 	return wl_cfg_stop_ap(wl_ifp_of_dev(dev));
 }
 
@@ -594,22 +676,83 @@ static int wl_cfg_scan_op(struct wiphy *wiphy, struct cfg80211_scan_request *req
 		ssid = req->ssids[0].ssid;
 		ssid_len = req->ssids[0].ssid_len;
 	}
-	err = wl_cfg_scan(cfg->vif[0].ifp, ssid, ssid_len);
+	/* always on the primary (STA) bsscfg: the core scans there in apsta mode, AP running or not */
+	err = wl_cfg_scan(cfg->bss[0], ssid, ssid_len);
 	if (err)
 		return -EBUSY;
 	cfg->scan_req = req;	/* finished by WLC_E_SCAN_COMPLETE */
 	return 0;
 }
 
+/*
+ * Channel load for hostapd's automatic channel selection (ACS). ACS ranks channels by the busy
+ * time in a survey of every channel, but this core measures airtime (chanim) only on the channel
+ * it is on. So the survey is estimated from the scan results instead, as the core's own channel
+ * selection does: every BSS adds load to its 20 MHz channel(s), weighted by its signal, and less
+ * to the overlapping channels up to 4 away. A 40 MHz BSS (HT operation IE) loads both halves.
+ */
+static void wl_cfg_load_add(struct wl_cfg *cfg, int ch, u32 strength)
+{
+	int k, d;
+
+	for (k = 1; k <= 14; k++) {
+		d = k > ch ? k - ch : ch - k;
+		if (d < 5)
+			cfg->load[k] += strength * (5 - d) / 5;
+	}
+}
+
+static void wl_cfg_load_one(struct wl_cfg *cfg, const struct wl_cfg_bss *b)
+{
+	const u8 *ie = b->ies, *end = b->ies + b->ies_len;
+	int rssi = b->rssi ? b->rssi : -80, sec = 0;
+	u32 s;
+
+	if (b->channel < 1 || b->channel > 14)
+		return;
+	/* -95 dBm and below: 5%; -45 dBm and above: 100% */
+	s = rssi <= -95 ? 50 : rssi >= -45 ? WL_CFG_LOAD_FULL : (rssi + 95) * WL_CFG_LOAD_FULL / 50;
+	if (s < 50)
+		s = 50;
+	while (ie + 2 <= end && ie + 2 + ie[1] <= end) {
+		if (ie[0] == WLAN_EID_HT_OPERATION && ie[1] >= 2 && (ie[3] & 0x04)) {
+			if ((ie[3] & 0x03) == 1)
+				sec = 4;
+			else if ((ie[3] & 0x03) == 3)
+				sec = -4;
+		}
+		ie += 2 + ie[1];
+	}
+	wl_cfg_load_add(cfg, b->channel, s);
+	if (sec && b->channel + sec >= 1 && b->channel + sec <= 14)
+		wl_cfg_load_add(cfg, b->channel + sec, s);
+}
+
+struct wl_cfg_scan_ctx {
+	struct wl_cfg_inform_ctx inform;
+	struct wl_cfg *cfg;
+};
+
+static void wl_cfg_scan_one(void *ctx, const struct wl_cfg_bss *b)
+{
+	struct wl_cfg_scan_ctx *c = ctx;
+
+	wl_cfg_load_one(c->cfg, b);
+	wl_cfg_inform_one(&c->inform, b);
+}
+
 static void wl_cfg_scan_finish(struct wl_cfg *cfg, bool aborted)
 {
 	struct cfg80211_scan_info info = { .aborted = aborted };
-	struct wl_cfg_inform_ctx ctx = { .wiphy = cfg->wiphy };
+	struct wl_cfg_scan_ctx ctx = { .inform = { .wiphy = cfg->wiphy }, .cfg = cfg };
 
 	if (!cfg->scan_req)
 		return;
-	if (!aborted)
-		wl_cfg_scan_results(cfg->vif[0].ifp, wl_cfg_inform_one, &ctx);
+	if (!aborted) {
+		memset(cfg->load, 0, sizeof(cfg->load));
+		wl_cfg_scan_results(cfg->bss[0], wl_cfg_scan_one, &ctx);
+		cfg->load_valid = true;
+	}
 	cfg80211_scan_done(cfg->scan_req, &info);
 	cfg->scan_req = NULL;
 }
@@ -776,25 +919,100 @@ static void wl_cfg_evwork(struct work_struct *work)
 /* ------------------------------------------------------------------ interfaces */
 
 /*
- * BSS idx's address. Secondary BSSes need the core's MBSS pattern: locally administered, with the
- * index in the low bits of the last byte (4 BSSes). The same addresses are published in
- * wiphy->addresses, which mac80211.sh uses for additional interfaces (and hostapd then sets).
+ * Interface addresses. The core matches its secondary BSSes against one base address: the primary's
+ * MAC (at the time bsscfg 1 is created, so the real one) with the locally administered bit set and
+ * the last byte + 1, with the low 2 bits masked; a BSS's own low 2 bits are its index there
+ * (wlc_bsscfg_up, wlc_write_mbss_basemac). So an AP on bsscfg 1 can never use the real MAC.
+ * wiphy->addresses are two addresses inside that range; mac80211.sh gives the first one to the
+ * first interface (a STA, or a lone AP) and the second one to the next (the AP of a repeater).
+ * cfg80211 wants addresses[0] to be the wiphy's perm_addr, so that is the first one too (and the
+ * phy's "macaddress" in sysfs, which OpenWrt matches the radio by).
  */
 #define WL_CFG_MBSS_MASK	3
 
-static void wl_cfg_vif_mac(struct wl_cfg *cfg, int idx, u8 *mac)
+static void wl_cfg_vif_mac(struct wl_cfg *cfg, int k, u8 *mac)
 {
-	memcpy(mac, cfg->wiphy->perm_addr, ETH_ALEN);
-	if (idx) {
-		mac[0] |= 0x02;
-		mac[5] = (mac[5] & ~WL_CFG_MBSS_MASK) | ((mac[5] + idx) & WL_CFG_MBSS_MASK);
+	u8 base = cfg->hw_mac[5] + 1;
+
+	memcpy(mac, cfg->hw_mac, ETH_ALEN);
+	mac[0] |= 0x02;
+	mac[5] = (base & ~WL_CFG_MBSS_MASK) | ((base + k) & WL_CFG_MBSS_MASK);
+}
+
+/* apsta mode and bsscfg 1, once, before any interface address changes the primary's MAC */
+static int wl_cfg_prepare(struct wl_cfg *cfg)
+{
+	u8 mac[ETH_ALEN];
+	int err;
+
+	if (cfg->apsta)
+		return 0;
+	if (!cfg->bss[1]) {
+		cfg->bss[1] = wl_cfg_if_alloc(cfg->wl);
+		if (!cfg->bss[1])
+			return -ENOMEM;
 	}
+	err = wl_cfg_set_mode(cfg->wl, true, true);
+	wl_cfg_vif_mac(cfg, 0, mac);
+	err = err ?: wl_cfg_if_bss_create(cfg->bss[1], 1, mac);
+	if (!err)
+		cfg->apsta = true;
+	return err;
 }
 
 /*
- * One STA and one AP at most. The first interface added becomes vif 0 (the core's primary
- * bsscfg, AP or STA); an AP added while vif 0 is a STA becomes vif 1 (apsta mode).
+ * The default address for a new interface: a STA takes the first one, an AP the first one no other
+ * interface has (mac80211.sh and hostapd then set the one it planned, normally the same).
  */
+static void wl_cfg_mac_for(struct wl_cfg *cfg, enum nl80211_iftype type, u8 *mac)
+{
+	int k, i;
+
+	for (k = 0; type == NL80211_IFTYPE_AP && k < WL_CFG_NADDR; k++) {
+		for (i = 0; i < WL_CFG_NVIF; i++)
+			if (cfg->vif[i].in_use && cfg->vif[i].wdev.netdev &&
+			    ether_addr_equal(cfg->vif[i].wdev.netdev->dev_addr, cfg->addrs[k].addr))
+				break;
+		if (i == WL_CFG_NVIF)
+			break;
+	}
+	wl_cfg_vif_mac(cfg, k < WL_CFG_NADDR ? k : 0, mac);
+}
+
+static struct wl_cfg_vif *wl_cfg_vif_of_ifp(struct wl_cfg *cfg, struct wl_if *ifp);
+
+static bool wl_cfg_bss_in_use(struct wl_cfg *cfg, struct wl_if *ifp)
+{
+	return wl_cfg_vif_of_ifp(cfg, ifp) != NULL;
+}
+
+/* the bsscfg for a new interface: the primary for a STA, a free AP bsscfg (created on demand) */
+static int wl_cfg_bss_for(struct wl_cfg *cfg, enum nl80211_iftype type, const u8 *mac,
+			  struct wl_if **ifpp)
+{
+	int b, err;
+
+	if (type == NL80211_IFTYPE_STATION) {
+		*ifpp = cfg->bss[0];
+		return 0;
+	}
+	for (b = 1; b < WL_CFG_NBSS; b++) {
+		if (cfg->bss[b] && wl_cfg_bss_in_use(cfg, cfg->bss[b]))
+			continue;
+		if (!cfg->bss[b]) {
+			cfg->bss[b] = wl_cfg_if_alloc(cfg->wl);
+			if (!cfg->bss[b])
+				return -ENOMEM;
+		}
+		err = wl_cfg_if_bss_create(cfg->bss[b], b, mac);
+		if (err)
+			return err;
+		*ifpp = cfg->bss[b];
+		return 0;
+	}
+	return -EBUSY;
+}
+
 static struct wireless_dev *wl_cfg_add_virtual_intf(struct wiphy *wiphy, const char *name,
 						    unsigned char name_assign_type,
 						    enum nl80211_iftype type,
@@ -803,58 +1021,58 @@ static struct wireless_dev *wl_cfg_add_virtual_intf(struct wiphy *wiphy, const c
 	struct wl_cfg *cfg = wl_cfg_of(wiphy);
 	struct wl_cfg_vif *vif;
 	struct net_device *dev;
+	struct wl_if *ifp;
 	u8 mac[ETH_ALEN];
 	int err;
 
 	ASSERT_RTNL();
 	if (type != NL80211_IFTYPE_AP && type != NL80211_IFTYPE_STATION)
 		return ERR_PTR(-EOPNOTSUPP);
-	if (!cfg->vif[0].in_use) {
-		vif = &cfg->vif[0];
-		err = wl_cfg_set_mode(cfg->wl, type == NL80211_IFTYPE_STATION, false);
-	} else if (type == NL80211_IFTYPE_AP &&
-		   cfg->vif[0].wdev.iftype == NL80211_IFTYPE_STATION && !cfg->vif[1].in_use) {
-		vif = &cfg->vif[1];
-		if (!vif->ifp) {
-			vif->ifp = wl_cfg_if_alloc(cfg->wl);
-			if (!vif->ifp)
-				return ERR_PTR(-ENOMEM);
-		}
-		err = wl_cfg_set_mode(cfg->wl, true, true);
-		wl_cfg_vif_mac(cfg, 1, mac);
-		err = err ?: wl_cfg_if_bss_create(vif->ifp, 1, mac);
-	} else {
-		return ERR_PTR(-EBUSY);		/* no second STA, no AP+AP (multiple SSIDs) yet */
-	}
+	/* one address each: the iface combination is only checked when an interface goes up */
+	if (wl_cfg_n_of_type(cfg, NL80211_IFTYPE_STATION) + wl_cfg_n_of_type(cfg, NL80211_IFTYPE_AP) >=
+	    WL_CFG_NADDR ||
+	    (type == NL80211_IFTYPE_STATION ? wl_cfg_vif_of_type(cfg, type) != NULL :
+	     wl_cfg_n_of_type(cfg, type) >= WL_CFG_MAX_AP))
+		return ERR_PTR(-EBUSY);
+	err = wl_cfg_prepare(cfg);
+	wl_cfg_mac_for(cfg, type, mac);
+	err = err ?: wl_cfg_bss_for(cfg, type, mac, &ifp);
 	if (err) {
 		wiphy_err(wiphy, "cannot set up %s as %s: %d\n", name,
 			  type == NL80211_IFTYPE_AP ? "AP" : "STA", err);
 		return ERR_PTR(err);
 	}
-	dev = wl_cfg_if_dev(vif->ifp);
-	if (dev && !strcmp(dev->name, name)) {
-		/* the interface created at probe, under the requested name: keep it */
-		vif->wdev.iftype = type;
-	} else {
-		if (dev)
-			wl_cfg_netdev_destroy(vif->ifp);	/* e.g. the probe-time wlan0 under another name */
-		memset(&vif->wdev, 0, sizeof(vif->wdev));
-		vif->wdev.wiphy = wiphy;
-		vif->wdev.iftype = type;
-		wl_cfg_vif_mac(cfg, vif->idx, mac);
-		dev = wl_cfg_netdev_alloc(vif->ifp, name, name_assign_type, mac);
-		if (IS_ERR(dev))
-			return ERR_CAST(dev);
-		dev->ieee80211_ptr = &vif->wdev;
-		vif->wdev.netdev = dev;
-		err = wl_cfg_netdev_register(vif->ifp, dev);
-		if (err) {
-			vif->wdev.netdev = NULL;
-			wiphy_err(wiphy, "cannot create %s: %d\n", name, err);
-			return ERR_PTR(err);
+	/* the interface created at probe, on the primary bsscfg and not handed out yet */
+	dev = wl_cfg_if_dev(cfg->bss[0]);
+	if (!cfg->vif[0].in_use && dev) {
+		if (type == NL80211_IFTYPE_STATION && !strcmp(dev->name, name)) {
+			vif = &cfg->vif[0];		/* the one OpenWrt asks for: keep it */
+			vif->ifp = ifp;
+			vif->wdev.iftype = type;
+			goto done;
 		}
+		wl_cfg_netdev_destroy(cfg->bss[0]);
 	}
+	for (vif = &cfg->vif[0]; vif->in_use; vif++)
+		;			/* a free one exists: at most WL_CFG_NADDR are in use */
+	memset(&vif->wdev, 0, sizeof(vif->wdev));
+	vif->wdev.wiphy = wiphy;
+	vif->wdev.iftype = type;
+	vif->ifp = ifp;
+	dev = wl_cfg_netdev_alloc(ifp, name, name_assign_type, mac);
+	if (IS_ERR(dev))
+		return ERR_CAST(dev);
+	dev->ieee80211_ptr = &vif->wdev;
+	vif->wdev.netdev = dev;
+	err = wl_cfg_netdev_register(ifp, dev);
+	if (err) {
+		vif->wdev.netdev = NULL;
+		wiphy_err(wiphy, "cannot create %s: %d\n", name, err);
+		return ERR_PTR(err);
+	}
+done:
 	vif->in_use = true;
+	vif->ap_started = false;
 	vif->connecting = vif->connected = vif->keyed = false;
 	return &vif->wdev;
 }
@@ -867,11 +1085,12 @@ static int wl_cfg_del_virtual_intf(struct wiphy *wiphy, struct wireless_dev *wde
 	ASSERT_RTNL();
 	if (vif->wdev.iftype == NL80211_IFTYPE_STATION && (vif->connected || vif->connecting))
 		wl_cfg_disassoc(vif->ifp);
-	if (vif->idx == 1)
+	if (vif->wdev.iftype == NL80211_IFTYPE_AP)
 		wl_cfg_stop_ap(vif->ifp);
 	if (cfg->scan_req && cfg->scan_req->wdev == wdev)
 		wl_cfg_scan_finish(cfg, true);
 	vif->connecting = vif->connected = vif->keyed = false;
+	vif->ap_started = false;
 	vif->in_use = false;
 	/*
 	 * wdev.netdev must stay set: nl80211 holds a reference on it during this request and drops it
@@ -879,26 +1098,50 @@ static int wl_cfg_del_virtual_intf(struct wiphy *wiphy, struct wireless_dev *wde
 	 * else uses the pointer while in_use is false, and add_virtual_intf rewrites the wdev.
 	 */
 	wl_cfg_netdev_destroy(vif->ifp);
+	/* without a STA interface the primary bsscfg is the radio's own again (not an AP's address) */
+	if (vif->ifp == cfg->bss[0])
+		wl_cfg_if_set_mac(cfg->bss[0], cfg->hw_mac);
 	return 0;
 }
 
+/* AP <-> STA on an existing (down) interface: it moves to the other bsscfg, with that one's address */
 static int wl_cfg_change_virtual_intf(struct wiphy *wiphy, struct net_device *ndev,
 				      enum nl80211_iftype type, struct vif_params *params)
 {
 	struct wl_cfg *cfg = wl_cfg_of(wiphy);
 	struct wl_cfg_vif *vif = wl_vif_of_dev(ndev);
+	struct wl_if *to;
+	u8 mac[ETH_ALEN];
 	int err;
 
+	ASSERT_RTNL();
 	if (type == vif->wdev.iftype)
 		return 0;
 	if (type != NL80211_IFTYPE_AP && type != NL80211_IFTYPE_STATION)
 		return -EOPNOTSUPP;
-	if (vif->idx != 0 || cfg->vif[1].in_use)
+	if ((type == NL80211_IFTYPE_STATION ? wl_cfg_vif_of_type(cfg, type) != NULL :
+	     wl_cfg_n_of_type(cfg, type) >= WL_CFG_MAX_AP) || netif_running(ndev))
 		return -EBUSY;
-	err = wl_cfg_set_mode(cfg->wl, type == NL80211_IFTYPE_STATION, false);
-	if (!err)
-		vif->wdev.iftype = type;
-	return err;
+	err = wl_cfg_prepare(cfg);
+	wl_cfg_mac_for(cfg, type, mac);
+	err = err ?: wl_cfg_bss_for(cfg, type, mac, &to);
+	if (err)
+		return err;
+	if (vif->wdev.iftype == NL80211_IFTYPE_AP)
+		wl_cfg_stop_ap(vif->ifp);
+	else if (vif->connected || vif->connecting)
+		wl_cfg_disassoc(vif->ifp);
+	vif->ap_started = false;
+	err = wl_cfg_netdev_move(vif->ifp, to, mac);
+	if (err)
+		return err;
+	if (vif->ifp == cfg->bss[0])		/* as in del_virtual_intf */
+		wl_cfg_if_set_mac(cfg->bss[0], cfg->hw_mac);
+	vif->ifp = to;
+	vif->wdev.iftype = type;
+	vif->in_use = true;
+	vif->connecting = vif->connected = vif->keyed = false;
+	return 0;
 }
 
 static const struct cfg80211_ops wl_cfg_ops = {
@@ -931,12 +1174,13 @@ static const struct cfg80211_ops wl_cfg_ops = {
 
 /* ------------------------------------------------------------------ notifications from the glue */
 
+/* the interface in use on a bsscfg (the probe-time one may still point at bsscfg 0, unused) */
 static struct wl_cfg_vif *wl_cfg_vif_of_ifp(struct wl_cfg *cfg, struct wl_if *ifp)
 {
 	int i;
 
 	for (i = 0; i < WL_CFG_NVIF; i++)
-		if (cfg->vif[i].ifp == ifp)
+		if (cfg->vif[i].in_use && cfg->vif[i].ifp == ifp)
 			return &cfg->vif[i];
 	return NULL;
 }
@@ -979,6 +1223,14 @@ static void wl_cfg_queue(struct wl_cfg *cfg, struct wl_cfg_vif *vif, const struc
 }
 
 /* softirq context, from wl_sendup() */
+void wl_cfg80211_if_down(struct wl_cfg *cfg, struct net_device *dev)
+{
+	ASSERT_RTNL();
+	/* cfg80211 warns, and frees the request, if a scan is still running when its netdev is down */
+	if (cfg && cfg->scan_req && cfg->scan_req->wdev == dev->ieee80211_ptr)
+		wl_cfg_scan_finish(cfg, true);
+}
+
 void wl_cfg80211_event(struct wl_cfg *cfg, struct wl_if *ifp, const struct wl_cfg_event *ev)
 {
 	struct wl_cfg_vif *vif;
@@ -991,8 +1243,8 @@ void wl_cfg80211_event(struct wl_cfg *cfg, struct wl_if *ifp, const struct wl_cf
 		return;
 	}
 	/* the event header says which BSS it is about; the interface it arrived on may not */
-	if (ev->bsscfgidx >= 0 && ev->bsscfgidx < WL_CFG_NVIF && cfg->vif[ev->bsscfgidx].ifp)
-		vif = &cfg->vif[ev->bsscfgidx];
+	if (ev->bsscfgidx >= 0 && ev->bsscfgidx < WL_CFG_NBSS && cfg->bss[ev->bsscfgidx])
+		vif = wl_cfg_vif_of_ifp(cfg, cfg->bss[ev->bsscfgidx]);
 	else
 		vif = wl_cfg_vif_of_ifp(cfg, ifp);
 	if (!vif || !vif->in_use)
@@ -1043,7 +1295,7 @@ void wl_cfg80211_event(struct wl_cfg *cfg, struct wl_if *ifp, const struct wl_cf
 static void wl_cfg_setup_band(struct wl_cfg *cfg, struct ieee80211_channel *chans)
 {
 	u32 valid[32];
-	int i, j, n = wl_cfg_valid_channels(cfg->vif[0].ifp, valid, ARRAY_SIZE(valid));
+	int i, j, n = wl_cfg_valid_channels(cfg->bss[0], valid, ARRAY_SIZE(valid));
 
 	memcpy(chans, wl_cfg_channels_2g, sizeof(wl_cfg_channels_2g));
 	for (i = 0; n > 0 && i < ARRAY_SIZE(wl_cfg_channels_2g); i++) {
@@ -1078,7 +1330,8 @@ struct wl_cfg *wl_cfg80211_attach(struct wl_info *wl, struct net_device *dev, st
 		cfg->vif[i].cfg = cfg;
 		cfg->vif[i].idx = i;
 	}
-	cfg->vif[0].ifp = wl_cfg_primary(wl);
+	cfg->bss[0] = wl_cfg_primary(wl);
+	cfg->vif[0].ifp = cfg->bss[0];
 	spin_lock_init(&cfg->evlock);
 	INIT_LIST_HEAD(&cfg->evq);
 	INIT_WORK(&cfg->evwork, wl_cfg_evwork);
@@ -1086,11 +1339,12 @@ struct wl_cfg *wl_cfg80211_attach(struct wl_info *wl, struct net_device *dev, st
 	wl_cfg_setup_band(cfg, chans);
 
 	set_wiphy_dev(wiphy, parent);
-	memcpy(wiphy->perm_addr, dev->dev_addr, ETH_ALEN);
-	for (i = 0; i < WL_CFG_NVIF; i++)
+	memcpy(cfg->hw_mac, dev->dev_addr, ETH_ALEN);
+	for (i = 0; i < WL_CFG_NADDR; i++)
 		wl_cfg_vif_mac(cfg, i, cfg->addrs[i].addr);
+	memcpy(wiphy->perm_addr, cfg->addrs[0].addr, ETH_ALEN);
 	wiphy->addresses = cfg->addrs;
-	wiphy->n_addresses = WL_CFG_NVIF;
+	wiphy->n_addresses = WL_CFG_NADDR;
 	wiphy->interface_modes = BIT(NL80211_IFTYPE_AP) | BIT(NL80211_IFTYPE_STATION);
 	wiphy->iface_combinations = wl_cfg_combinations;
 	wiphy->n_iface_combinations = ARRAY_SIZE(wl_cfg_combinations);
@@ -1118,9 +1372,9 @@ struct wl_cfg *wl_cfg80211_attach(struct wl_info *wl, struct net_device *dev, st
 		wiphy_free(wiphy);
 		return NULL;
 	}
-	/* the interface created at probe: an AP until OpenWrt says otherwise */
+	/* the interface created at probe, on the primary bsscfg: a STA until OpenWrt says otherwise */
 	cfg->vif[0].wdev.wiphy = wiphy;
-	cfg->vif[0].wdev.iftype = NL80211_IFTYPE_AP;
+	cfg->vif[0].wdev.iftype = NL80211_IFTYPE_STATION;
 	cfg->vif[0].wdev.netdev = dev;
 	dev->ieee80211_ptr = &cfg->vif[0].wdev;	/* before register_netdev: cfg80211 picks it up there */
 	return cfg;
@@ -1135,7 +1389,7 @@ const char *wl_cfg80211_name(struct wl_cfg *cfg)
 void wl_cfg80211_detach(struct wl_cfg *cfg)
 {
 	unsigned long flags;
-	int i;
+	int i, b;
 
 	if (!cfg)
 		return;
@@ -1151,26 +1405,30 @@ void wl_cfg80211_detach(struct wl_cfg *cfg)
 		cfg80211_scan_done(cfg->scan_req, &info);
 		cfg->scan_req = NULL;
 	}
-	for (i = 1; i < WL_CFG_NVIF; i++)
-		if (cfg->vif[i].ifp) {
-			wl_cfg_netdev_destroy(cfg->vif[i].ifp);
-			cfg->vif[i].wdev.netdev = NULL;
-		}
+	/* the primary's interface is gone already (the glue unregistered it) */
+	for (b = 1; b < WL_CFG_NBSS; b++) {
+		if (!cfg->bss[b])
+			continue;
+		wl_cfg_netdev_destroy(cfg->bss[b]);
+		for (i = 0; i < WL_CFG_NVIF; i++)
+			if (cfg->vif[i].ifp == cfg->bss[b])
+				cfg->vif[i].wdev.netdev = NULL;
+	}
 	rtnl_unlock();
 	wiphy_unregister(cfg->wiphy);
 }
 
-/* stage 2: after the core detached (it may call wl_del_if() for vif 1's BSS until then) */
+/* stage 2: after the core detached (it may call wl_del_if() for the AP bsscfgs until then) */
 void wl_cfg80211_free(struct wl_cfg *cfg)
 {
 	struct wl_cfg_qev *q, *n;
-	int i;
+	int b;
 
 	if (!cfg)
 		return;
 	list_for_each_entry_safe(q, n, &cfg->evq, list)
 		kfree(q);
-	for (i = 1; i < WL_CFG_NVIF; i++)
-		wl_cfg_if_free(cfg->vif[i].ifp);
+	for (b = 1; b < WL_CFG_NBSS; b++)
+		wl_cfg_if_free(cfg->bss[b]);
 	wiphy_free(cfg->wiphy);
 }

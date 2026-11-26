@@ -47,8 +47,9 @@ struct wl_cfg_sta {
 #define WL_CFG_AUTH_WPA2_8021X	0x8
 
 struct wl_cfg_ap {
-	int channel;		/* control channel; ignored on a secondary BSS: the radio follows the STA */
+	int channel;		/* control channel (used if set_radio) */
 	int center_channel;	/* 40 MHz: centre of the pair (channel +/- 2); 0 = 20 MHz */
+	bool set_radio;		/* set the radio's channel; not while a STA (repeater) decides it */
 	int beacon_int;		/* TU, 0 = leave */
 	int dtim;		/* 0 = leave */
 	bool hidden;
@@ -121,12 +122,16 @@ struct net_device *wl_cfg_netdev_alloc(struct wl_if *ifp, const char *name,
 				       unsigned char name_assign_type, const u8 *mac);
 int wl_cfg_netdev_register(struct wl_if *ifp, struct net_device *dev);	/* frees dev on error */
 void wl_cfg_netdev_destroy(struct wl_if *ifp);
+/* a BSS's own address (cur_etheraddr) */
+int wl_cfg_if_set_mac(struct wl_if *ifp, const u8 *mac);
+/* hand a (down) net_device over to another BSS (interface type change), with that BSS's address */
+int wl_cfg_netdev_move(struct wl_if *from, struct wl_if *to, const u8 *mac);
 /* a secondary BSS: allocated once, its core bsscfg created on first use */
 struct wl_if *wl_cfg_if_alloc(struct wl_info *wl);
 int wl_cfg_if_bss_create(struct wl_if *ifp, int idx, const u8 *mac);
 void wl_cfg_if_free(struct wl_if *ifp);
 
-/* radio mode: primary BSS as STA or AP; apsta = primary STA plus AP BSSes */
+/* radio mode: primary BSS as STA or AP; apsta = primary STA plus AP BSSes (the cfg80211 build) */
 int wl_cfg_set_mode(struct wl_info *wl, bool primary_sta, bool apsta);
 
 int wl_cfg_ioctl(struct wl_if *ifp, int cmd, void *buf, int len);
@@ -173,6 +178,8 @@ const char *wl_cfg80211_name(struct wl_cfg *cfg);
 void wl_cfg80211_ssid_changed(struct wl_cfg *cfg, struct wl_if *ifp, const u8 *ssid, int len);
 /* a core event for BSS ifp; softirq context */
 void wl_cfg80211_event(struct wl_cfg *cfg, struct wl_if *ifp, const struct wl_cfg_event *ev);
+/* net_device going down (ndo_stop, RTNL held): end what cfg80211 expects done by then (scans) */
+void wl_cfg80211_if_down(struct wl_cfg *cfg, struct net_device *dev);
 #else
 static inline struct wl_cfg *wl_cfg80211_attach(struct wl_info *wl, struct net_device *dev,
 						struct device *parent) { return NULL; }

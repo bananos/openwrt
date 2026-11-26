@@ -96,6 +96,7 @@ struct wl_if {
 	struct wl_info *wl;
 	struct net_device *dev;
 	struct wlc_if *wlcif;		/* NULL until the core created the bsscfg */
+	int idx;			/* the core's bsscfg index: 0 primary, 1-3 AP BSSes */
 	bool open;
 };
 
@@ -576,6 +577,7 @@ static int wl_close(struct net_device *dev)
 
 	netif_stop_queue(dev);
 	netif_carrier_off(dev);
+	wl_cfg80211_if_down(wl->cfg, dev);
 	WL_LOCK(wl);
 	if (ifp->open) {
 		ifp->open = FALSE;
@@ -667,6 +669,39 @@ static int wl_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 	return err ? -EINVAL : 0;
 }
 
+/*
+ * A bsscfg's own address, perimeter lock held. The core takes it only with the radio down
+ * (BCME_NOTDOWN otherwise, also for a bsscfg that is itself down): then the radio goes down and up
+ * around it. BSSes that were up come back by themselves and their stations stay associated (tested
+ * with an AP on bsscfg 1). Nothing is done if the address is already the one asked for.
+ */
+static int wl_bss_mac_apply(struct wl_info *wl, struct wl_if *ifp, const u8 *mac)
+{
+	u8 cur[WLC_IOCTL_SMLEN];
+	int err;
+
+	if (!ifp->wlcif)
+		return BCME_NOTFOUND;
+	if (!wlc_iovar_op(wl->wlc, "cur_etheraddr", NULL, 0, cur, sizeof(cur), FALSE, ifp->wlcif) &&
+	    ether_addr_equal(cur, mac))
+		return 0;
+	err = wlc_iovar_op(wl->wlc, "cur_etheraddr", NULL, 0, (void *)mac, ETHER_ADDR_LEN, TRUE,
+			   ifp->wlcif);
+	if (err != BCME_NOTDOWN)
+		return err;
+	if (trace_ioctl)
+		pr_info("wl: radio down/up for bss %d address %pM\n", ifp->idx, mac);
+	wlc_ioctl(wl->wlc, WLC_DOWN, NULL, 0, wl->wlif->wlcif);
+	err = wlc_iovar_op(wl->wlc, "cur_etheraddr", NULL, 0, (void *)mac, ETHER_ADDR_LEN, TRUE,
+			   ifp->wlcif);
+	if (wl->n_open) {
+		int e = wlc_ioctl(wl->wlc, WLC_UP, NULL, 0, wl->wlif->wlcif);
+
+		err = err ?: e;
+	}
+	return err;
+}
+
 static int wl_set_mac_address(struct net_device *dev, void *addr)
 {
 	struct sockaddr *sa = addr;
@@ -678,11 +713,12 @@ static int wl_set_mac_address(struct net_device *dev, void *addr)
 		return -EADDRNOTAVAIL;
 	WL_LOCK(wl);
 	if (ifp->wlcif)		/* else applied when the bsscfg is created */
-		err = wlc_iovar_op(wl->wlc, "cur_etheraddr", NULL, 0, sa->sa_data, ETHER_ADDR_LEN,
-				   TRUE, ifp->wlcif);
+		err = wl_bss_mac_apply(wl, ifp, sa->sa_data);
 	WL_UNLOCK(wl);
-	if (err)
+	if (err) {
+		netdev_warn(dev, "cannot set the BSS address %pM: %d\n", sa->sa_data, err);
 		return -EINVAL;
+	}
 	memcpy(dev->dev_addr, sa->sa_data, ETH_ALEN);
 	return 0;
 }
@@ -775,7 +811,50 @@ int wl_cfg_netdev_register(struct wl_if *ifp, struct net_device *dev)
 	}
 	WL_LOCK(wl);
 	ifp->dev = dev;
+	/* the BSS sends from the interface's address (hostapd/mac80211.sh may change it later) */
+	err = ifp->wlcif ? wl_bss_mac_apply(wl, ifp, dev->dev_addr) : 0;
+	if (err)
+		pr_warn("%s: cannot set the BSS address %pM: %d\n", dev->name, dev->dev_addr, err);
 	WL_UNLOCK(wl);
+	return 0;
+}
+
+int wl_cfg_if_set_mac(struct wl_if *ifp, const u8 *mac)
+{
+	struct wl_info *wl = ifp->wl;
+	int err = -ENODEV;
+
+	WL_LOCK(wl);
+	if (ifp->wlcif)
+		err = wl_bss_mac_apply(wl, ifp, mac);
+	WL_UNLOCK(wl);
+	if (err)
+		pr_warn("wl: cannot set a BSS address to %pM: %d\n", mac, err);
+	return err ? -EIO : 0;
+}
+
+int wl_cfg_netdev_move(struct wl_if *from, struct wl_if *to, const u8 *mac)
+{
+	struct wl_info *wl = from->wl;
+	struct net_device *dev = from->dev;
+	int err = 0;
+
+	ASSERT_RTNL();
+	if (!dev || to->dev || netif_running(dev))
+		return -EBUSY;
+	WL_LOCK(wl);
+	from->dev = NULL;
+	to->dev = dev;
+	*(struct wl_if **)netdev_priv(dev) = to;
+	if (to->wlcif)
+		err = wl_bss_mac_apply(wl, to, mac);
+	WL_UNLOCK(wl);
+	if (err)
+		pr_warn("%s: cannot set the BSS address %pM: %d\n", dev->name, mac, err);
+	if (!ether_addr_equal(dev->dev_addr, mac)) {
+		memcpy(dev->dev_addr, mac, ETH_ALEN);
+		call_netdevice_notifiers(NETDEV_CHANGEADDR, dev);
+	}
 	return 0;
 }
 
@@ -868,6 +947,7 @@ int wl_cfg_if_bss_create(struct wl_if *ifp, int idx, const u8 *mac)
 
 	if (ifp->wlcif)
 		return 0;
+	ifp->idx = idx;
 	memset(&ssid, 0, sizeof(ssid));
 	ssid.SSID_len = 1;
 	ssid.SSID[0] = '-';
@@ -883,8 +963,13 @@ int wl_cfg_if_bss_create(struct wl_if *ifp, int idx, const u8 *mac)
 	if (err)
 		return err;
 	wl_bss_set(wl, idx, 3);	/* make it an AP */
-	if (mac)
-		wl_bssiovar_set(wl, idx, "cur_etheraddr", mac, ETHER_ADDR_LEN);
+	if (mac) {
+		WL_LOCK(wl);
+		err = wl_bss_mac_apply(wl, ifp, mac);
+		WL_UNLOCK(wl);
+		if (err)
+			pr_warn("wl: cannot set bss %d address %pM: %d\n", idx, mac, err);
+	}
 	return 0;
 }
 
@@ -1160,6 +1245,41 @@ static void wl_cfg_sec(u32 wsec_in, u32 auth_in, int *wsec, int *wpa_auth)
 }
 
 /*
+ * The radio's channel and width, set by the first AP to start while the primary (STA) bsscfg is
+ * idle; with a STA connected (repeater) the radio follows the STA instead. First while up, so that
+ * the BSSes stay as they are; the core may want the radio down for some of these.
+ */
+static int wl_cfg_radio_chan(struct wl_info *wl, const struct wl_cfg_ap *ap)
+{
+	struct wl_if *pri = wl->wlif;
+	int bw = ap->center_channel ? 1 : 0;
+	int cs = wl_cfg_mk_chanspec(ap->channel, ap->center_channel);
+	int err;
+
+	err = wl_cfg_iovar_setint(pri, "mimo_bw_cap", bw);
+	err = err ?: wl_cfg_iovar_setint(pri, "chanspec", cs);
+	if (!err && ap->beacon_int && wl_cfg_setint(pri, WLC_SET_BCNPRD, ap->beacon_int))
+		err = -EBUSY;
+	if (!err)
+		return 0;
+	if (trace_ioctl)
+		pr_info("wl: radio channel 0x%04x needs the radio down\n", cs);
+	err = wl_cfg_ioctl(pri, WLC_DOWN, NULL, 0);
+	if (nompc)
+		err = err ?: wl_cfg_iovar_setint(pri, "mpc", 0);
+	err = err ?: wl_cfg_iovar_setint(pri, "mimo_bw_cap", bw);
+	err = err ?: wl_cfg_iovar_setint(pri, "chanspec", cs);
+	if (!err && ap->beacon_int)
+		err = wl_cfg_setint(pri, WLC_SET_BCNPRD, ap->beacon_int);
+	if (wl->n_open) {
+		int e = wl_cfg_ioctl(pri, WLC_UP, NULL, 0);
+
+		err = err ?: e;
+	}
+	return err;
+}
+
+/*
  * AP on the primary bsscfg: the same sequence as brcmwl.sh, known to work with this core.
  * AP on a secondary bsscfg (AP+STA): security per bsscfg, channel and beacon timing come from the
  * radio (the STA), and the BSS is brought up with the "bss" iovar instead of WLC_UP.
@@ -1194,8 +1314,10 @@ int wl_cfg_start_ap(struct wl_if *ifp, const struct wl_cfg_ap *ap)
 		if (!err && ap->dtim)
 			err = wl_cfg_setint(ifp, WLC_SET_DTIMPRD, ap->dtim);
 	} else {
-		wl_bss_set(wl, 1, 0);	/* down first; fails harmlessly if it already is */
-		err = 0;
+		wl_bss_set(wl, ifp->idx, 0);	/* down first; fails harmlessly if it already is */
+		err = ap->set_radio ? wl_cfg_radio_chan(wl, ap) : 0;
+		if (!err && ap->dtim && wl_cfg_setint(ifp, WLC_SET_DTIMPRD, ap->dtim))
+			pr_info("wl: DTIM period %d not set on bss %d\n", ap->dtim, ifp->idx);
 	}
 	err = err ?: wl_cfg_setint(ifp, WLC_SET_CLOSED, ap->hidden);
 	err = err ?: wl_cfg_setint(ifp, WLC_SET_AUTH, ap->shared_key ? 1 : 0);
@@ -1215,15 +1337,15 @@ int wl_cfg_start_ap(struct wl_if *ifp, const struct wl_cfg_ap *ap)
 	memcpy(ssid.SSID, ap->ssid, ap->ssid_len);
 	if (primary)
 		return wl_cfg_ioctl(ifp, WLC_SET_SSID, &ssid, sizeof(ssid));
-	err = wl_bssiovar_set(wl, 1, "ssid", &ssid, sizeof(ssid));
-	return err ?: wl_bss_set(wl, 1, 1);
+	err = wl_bssiovar_set(wl, ifp->idx, "ssid", &ssid, sizeof(ssid));
+	return err ?: wl_bss_set(wl, ifp->idx, 1);
 }
 
 int wl_cfg_stop_ap(struct wl_if *ifp)
 {
 	if (ifp == ifp->wl->wlif)
 		return wl_cfg_ioctl(ifp, WLC_DOWN, NULL, 0);
-	return wl_bss_set(ifp->wl, 1, 0);
+	return wl_bss_set(ifp->wl, ifp->idx, 0);
 }
 
 int wl_cfg_set_key(struct wl_if *ifp, int idx, const u8 *mac, enum wl_cfg_cipher cipher,
