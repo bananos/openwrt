@@ -51,6 +51,9 @@ struct wl_cfg_ap {
 	int center_channel;	/* 40 MHz: centre of the pair (channel +/- 2); 0 = 20 MHz */
 	bool set_radio;		/* set the radio's channel; not while a STA (repeater) decides it */
 	bool ht;		/* 802.11n (with set_radio): off for hostapd's legacy mode */
+	/* hostapd's legacy rate set (with set_radio), 500 kbit/s units, 0x80 = basic; 0 = leave */
+	int n_rates;
+	u8 rates[16];
 	int beacon_int;		/* TU, 0 = leave */
 	int dtim;		/* 0 = leave */
 	bool hidden;
@@ -144,6 +147,8 @@ int wl_cfg_iovar_setint(struct wl_if *ifp, const char *name, int val);
  * too, for settings the core applies only when it comes up (qtxpower).
  */
 int wl_cfg_radio_setint(struct wl_info *wl, const char *name, int val, bool cycle);
+/* the radio's legacy rate set (WLC_SET_RATESET): 500 kbit/s units, 0x80 = basic */
+int wl_cfg_radio_set_rates(struct wl_info *wl, const u8 *rates, int n);
 int wl_cfg_channel(struct wl_if *ifp, int *chan);
 /* current chanspec: control and centre channel, width in MHz (20 or 40) */
 int wl_cfg_chanspec(struct wl_if *ifp, int *ctl, int *center, int *width);

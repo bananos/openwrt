@@ -1063,6 +1063,40 @@ int wl_cfg_radio_setint(struct wl_info *wl, const char *name, int val, bool cycl
 	return err ?: e;
 }
 
+/*
+ * The rate set every BSS advertises and the basic rates. The core fixes it per gmode (none of
+ * them drops 802.11b), so hostapd's list goes in as it is: LuCI's "Allow legacy 802.11b rates"
+ * off, or any supported_rates/basic_rates. Taken while up if the core does, else down and up.
+ */
+int wl_cfg_radio_set_rates(struct wl_info *wl, const u8 *rates, int n)
+{
+	struct wl_if *pri = wl->wlif;
+	wl_rateset_t rs, cur;
+	int err, e;
+
+	if (n < 1 || n > WL_NUMRATES)
+		return -EINVAL;
+	memset(&rs, 0, sizeof(rs));
+	rs.count = n;
+	memcpy(rs.rates, rates, n);
+	memset(&cur, 0, sizeof(cur));
+	if (!wl_cfg_ioctl(pri, WLC_GET_RATESET, &cur, sizeof(cur)) && cur.count == rs.count &&
+	    !memcmp(cur.rates, rs.rates, n))
+		return 0;
+	err = wl_cfg_ioctl(pri, WLC_SET_RATESET, &rs, sizeof(rs));
+	if (!err)
+		return 0;
+	if (trace_ioctl)
+		pr_info("wl: radio down/up for a rate set of %d\n", n);
+	e = wl_cfg_ioctl(pri, WLC_DOWN, NULL, 0);
+	err = wl_cfg_ioctl(pri, WLC_SET_RATESET, &rs, sizeof(rs));
+	if (nompc)
+		wl_cfg_iovar_setint(pri, "mpc", 0);
+	if (wl->n_open)
+		e = e ?: wl_cfg_ioctl(pri, WLC_UP, NULL, 0);
+	return err ?: e;
+}
+
 static int wl_cfg_setint(struct wl_if *ifp, int cmd, int val)
 {
 	return wl_cfg_ioctl(ifp, cmd, &val, sizeof(val));
@@ -1311,6 +1345,11 @@ static int wl_cfg_radio_chan(struct wl_info *wl, const struct wl_cfg_ap *ap)
 	err = wl_cfg_radio_setint(wl, "nmode", ap->ht ? 1 : 0, true);
 	if (err)
 		pr_warn("wl: cannot set nmode %d: %d\n", ap->ht, err);
+	if (ap->n_rates) {
+		err = wl_cfg_radio_set_rates(wl, ap->rates, ap->n_rates);
+		if (err)
+			pr_warn("wl: cannot set the rate set (%d rates): %d\n", ap->n_rates, err);
+	}
 	err = wl_cfg_iovar_setint(pri, "mimo_bw_cap", bw);
 	err = err ?: wl_cfg_iovar_setint(pri, "chanspec", cs);
 	if (!err && ap->beacon_int && wl_cfg_setint(pri, WLC_SET_BCNPRD, ap->beacon_int))

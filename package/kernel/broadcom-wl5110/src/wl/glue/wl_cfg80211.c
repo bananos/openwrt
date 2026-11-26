@@ -501,6 +501,38 @@ static int wl_cfg_key_cipher(u32 suite, enum wl_cfg_cipher *c)
 
 static int wl_cfg_apply_acl(struct wl_cfg_vif *vif, const struct cfg80211_acl_data *acl);
 
+/*
+ * hostapd's legacy rate set, from the beacon it built: Supported Rates in the head (after the
+ * 24-byte header and 12 fixed bytes), Extended Supported Rates in the tail; basic rates have 0x80.
+ * Returns the count (0 if there is nothing to go by: the core keeps its own).
+ */
+static int wl_cfg_ies_rates(const u8 *ie, size_t len, u8 *rates, int n, int max)
+{
+	const u8 *end = ie + len;
+	int i;
+
+	while (ie + 2 <= end && ie + 2 + ie[1] <= end) {
+		if (ie[0] == WLAN_EID_SUPP_RATES || ie[0] == WLAN_EID_EXT_SUPP_RATES)
+			for (i = 0; i < ie[1] && n < max; i++)
+				if ((ie[2 + i] & 0x7f) != 0x7f)	/* not a BSS membership selector */
+					rates[n++] = ie[2 + i];
+		ie += 2 + ie[1];
+	}
+	return n;
+}
+
+static int wl_cfg_beacon_rates(const struct cfg80211_beacon_data *b, u8 *rates, int max)
+{
+	const size_t fixed = 24 + 12;
+	int n = 0;
+
+	if (b->head && b->head_len > fixed)
+		n = wl_cfg_ies_rates(b->head + fixed, b->head_len - fixed, rates, n, max);
+	if (n && b->tail)
+		n = wl_cfg_ies_rates(b->tail, b->tail_len, rates, n, max);
+	return n;
+}
+
 static int wl_cfg_start_ap_op(struct wiphy *wiphy, struct net_device *dev,
 			      struct cfg80211_ap_settings *s)
 {
@@ -520,6 +552,7 @@ static int wl_cfg_start_ap_op(struct wiphy *wiphy, struct net_device *dev,
 		return -EINVAL;
 	ap.channel = s->chandef.chan->hw_value;
 	ap.ht = s->chandef.width != NL80211_CHAN_WIDTH_20_NOHT;	/* LuCI's "Legacy" mode: no HT */
+	ap.n_rates = wl_cfg_beacon_rates(&s->beacon, ap.rates, ARRAY_SIZE(ap.rates));
 	if (s->chandef.width == NL80211_CHAN_WIDTH_40)
 		ap.center_channel = ieee80211_frequency_to_channel(s->chandef.center_freq1);
 	err = wl_cfg_crypto(&s->crypto, s->privacy, &ap.wsec, &ap.auth);
