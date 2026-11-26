@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Andrew Druchenko
 """
 wl_unlink.py - cut the closed 2.6.22 Linux glue (wl_linux.c) out of stock wl.ko 5.110.27.20012,
 leaving the wlc/phy core as a plain relocatable object (stage 1 output, before objcopy cleanup).

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: ISC
+// Copyright (c) 2026 Andrew Druchenko
 /*
  * linux_osl_414.c - Broadcom OSL for the closed wl 5.110.27.20012 core on Linux 4.14 (OpenWrt 19.07.10).
  *

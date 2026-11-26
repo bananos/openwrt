@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Andrew Druchenko
 # Extract the Broadcom 5.110.27.20012 wl core and userspace from an ASUS RT-N12 D1 firmware image,
 # then turn the stock wl.ko into wlc_core.o (glue unlinked, see wl_unlink.py).
 #

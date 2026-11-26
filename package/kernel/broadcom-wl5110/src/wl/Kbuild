@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Andrew Druchenko
 # wl.ko for OpenWrt 19.07.10 (Linux 4.14.275): closed 5.110.27 wlc core + Broadcom shared/ + new glue.
 obj-m := wl.o
 SHARED := aiutils bcmotp bcmsrom bcmutils hnddma hndpmu nicpci sbutils siutils

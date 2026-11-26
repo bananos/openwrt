@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Andrew Druchenko
 # First boot after installing brcmwl5110: make wl0 a permanent member of the lan bridge (netifd
 # then adds it whenever it (re)creates br-lan) and write a disabled AP config without a key.
 

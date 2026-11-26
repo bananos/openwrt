@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: ISC
+// Copyright (c) 2026 Andrew Druchenko
 /*
  * wl_linux_414.c - minimal Linux 4.14 glue for the closed Broadcom wl 5.110.27.20012 core
  * (RT-N12 D1, BCM5357C0, OpenWrt 19.07.10). Replaces the closed 2.6.22 wl_linux.c that was cut out of
@@ -85,11 +87,23 @@ extern void nvram_release(void);
 /* ------------------------------------------------------------------ private state */
 struct wl_info;
 
+/*
+ * One BSS of the core. Allocated separately from its net_device: with cfg80211 the net_device is
+ * created and destroyed as interfaces are added and deleted, while the core keeps the wl_if.
+ * dev may be NULL (no interface right now); it is changed under the perimeter lock.
+ */
 struct wl_if {
 	struct wl_info *wl;
 	struct net_device *dev;
-	struct wlc_if *wlcif;
+	struct wlc_if *wlcif;		/* NULL until the core created the bsscfg */
+	bool open;
 };
+
+/* net_device private data: just the BSS it belongs to */
+static inline struct wl_if *WLIF(struct net_device *dev)
+{
+	return *(struct wl_if **)netdev_priv(dev);
+}
 
 struct wl_timer {
 	struct timer_list timer;
@@ -111,8 +125,9 @@ struct wl_info {
 	void __iomem *regsva;
 	uint irq;
 	bool irq_requested;
-	struct wl_if *wlif;		/* primary interface */
-	struct net_device *dev;
+	struct wl_if *wlif;		/* primary BSS (bsscfg 0) */
+	struct wl_if *pending_if;	/* handed to the core by wl_add_if() */
+	int n_open;			/* open net_devices; the radio is up while > 0 */
 	spinlock_t lock;		/* perimeter lock */
 	spinlock_t isr_lock;
 	struct tasklet_struct tasklet;
@@ -169,16 +184,22 @@ int wl_up(struct wl_info *wl)
 
 	if (PUB_UP(wl->pub))
 		return 0;
+	/*
+	 * Changing between AP and STA mode resets "mpc" to 1, and with MPC an unassociated STA powers
+	 * the radio down (no scans, no join). Turn it off each time the radio comes up.
+	 */
+	if (nompc)
+		wlc_iovar_setint(wl->wlc, "mpc", 0);
 	err = wlc_up(wl->wlc);
-	if (!err)
-		netif_carrier_on(wl->dev);
+	if (!err && wl->wlif->dev)
+		netif_carrier_on(wl->wlif->dev);
 	return err;
 }
 
 void wl_down(struct wl_info *wl)
 {
-	if (wl->dev)
-		netif_carrier_off(wl->dev);
+	if (wl->wlif && wl->wlif->dev)
+		netif_carrier_off(wl->wlif->dev);
 	wl->callbacks = wlc_down(wl->wlc);
 }
 
@@ -306,6 +327,10 @@ void wl_free_timer(struct wl_info *wl, struct wl_timer *t)
 #define WLC_E_DISASSOC		11
 #define WLC_E_DISASSOC_IND	12
 #define WLC_E_STATUS_SUCCESS	0
+#define WLC_E_SET_SSID		0
+#define WLC_E_LINK		16
+#define WLC_E_SCAN_COMPLETE	26
+#define WLC_E_PSK_SUP		46
 
 /*
  * nas 5.10.56 (wpa_driver_assoc_msg) requires the (RE)ASSOC_IND payload to be exactly one IE, the
@@ -359,48 +384,60 @@ static void wl_event_to_v1(struct sk_buff *skb)
 	wl_event_assoc_ie_only(skb);
 }
 
+#define BCMEV_OFF_FLAGS		26
 #define BCMEV_OFF_STATUS	32
+#define BCMEV_OFF_REASON	36
+#define BCMEV_OFF_BSSCFGIDX	71	/* v2: ifidx at 70, bsscfgidx at 71 */
 #define BCMEV_OFF_ADDR		48
 
-/* station events for cfg80211; the frame itself still goes up for nas */
-static void wl_event_to_cfg(struct wl_info *wl, struct sk_buff *skb)
+/*
+ * Core events for cfg80211. Returns true if skb is a core event: with cfg80211 nothing in userspace
+ * reads those (no nas), and passing them up only feeds the bridge frames with the BSS's own address.
+ */
+static bool wl_event_to_cfg(struct wl_info *wl, struct wl_if *ifp, struct sk_buff *skb)
 {
 	u8 *d = skb->data;
-	u32 type, len;
+	struct wl_cfg_event ev;
 
 	if (!wl->cfg || skb->len < BCMEV_V2_HDRLEN || get_unaligned_be16(d + 12) != 0x886c ||
 	    d[BCMEV_OFF_OUI] != 0x00 || d[BCMEV_OFF_OUI + 1] != 0x10 || d[BCMEV_OFF_OUI + 2] != 0x18 ||
 	    get_unaligned_be16(d + BCMEV_OFF_USRSUB) != 1 || get_unaligned_be16(d + BCMEV_OFF_VER) != 2)
-		return;
-	type = get_unaligned_be32(d + BCMEV_OFF_TYPE);
-	len = get_unaligned_be32(d + BCMEV_OFF_DATALEN);
-	if (BCMEV_V2_HDRLEN + len > skb->len)
-		len = 0;
-	switch (type) {
-	case WLC_E_ASSOC_IND:
-	case WLC_E_REASSOC_IND:
-		if (get_unaligned_be32(d + BCMEV_OFF_STATUS) == WLC_E_STATUS_SUCCESS)
-			wl_cfg80211_sta_assoc(wl->cfg, d + BCMEV_OFF_ADDR, d + BCMEV_V2_HDRLEN, len);
-		break;
-	case WLC_E_DISASSOC_IND:
-	case WLC_E_DEAUTH_IND:
-	case WLC_E_DISASSOC:
-	case WLC_E_DEAUTH:
-		wl_cfg80211_sta_left(wl->cfg, d + BCMEV_OFF_ADDR);
-		break;
-	}
+		return false;
+	ev.type = get_unaligned_be32(d + BCMEV_OFF_TYPE);
+	ev.status = get_unaligned_be32(d + BCMEV_OFF_STATUS);
+	ev.reason = get_unaligned_be32(d + BCMEV_OFF_REASON);
+	ev.flags = get_unaligned_be16(d + BCMEV_OFF_FLAGS);
+	ev.len = get_unaligned_be32(d + BCMEV_OFF_DATALEN);
+	if (BCMEV_V2_HDRLEN + ev.len > skb->len)
+		ev.len = 0;
+	ev.data = d + BCMEV_V2_HDRLEN;
+	ev.bsscfgidx = d[BCMEV_OFF_BSSCFGIDX];	/* the core may send another BSS's events on bss 0 */
+	if (trace_ioctl)
+		pr_info("wl event type %u status %u reason %u flags 0x%x bss %d (rx on %s) %pM len %u\n",
+			ev.type, ev.status, ev.reason, ev.flags, ev.bsscfgidx,
+			ifp == wl->wlif ? "bss 0" : "bss 1", d + BCMEV_OFF_ADDR, ev.len);
+	if (trace_ioctl > 1 && ev.len)
+		print_hex_dump(KERN_INFO, "wl event data ", DUMP_PREFIX_OFFSET, 32, 1, ev.data,
+			       min_t(u32, ev.len, 96), false);
+	memcpy(ev.addr, d + BCMEV_OFF_ADDR, ETH_ALEN);
+	wl_cfg80211_event(wl->cfg, ifp, &ev);
+	return true;
 }
 
 /* RX: shadow chain -> native skbs -> stack */
 void wl_sendup(struct wl_info *wl, struct wl_if *wlif, void *p, int numpkt)
 {
-	struct net_device *dev = wlif ? wlif->dev : wl->dev;
+	struct wl_if *ifp = wlif ? wlif : wl->wlif;
+	struct net_device *dev = ifp->dev;
 	struct sk_buff *skb, *nxt;
 
 	for (skb = osl_pkt_tonative(wl->osh, p); skb; skb = nxt) {
 		nxt = skb->next;
 		skb->next = NULL;
-		wl_event_to_cfg(wl, skb);
+		if (wl_event_to_cfg(wl, ifp, skb) || !dev) {	/* consumed, or no interface now */
+			dev_kfree_skb_any(skb);
+			continue;
+		}
 		if (event_v1)
 			wl_event_to_v1(skb);
 		skb->dev = dev;
@@ -413,8 +450,10 @@ void wl_sendup(struct wl_info *wl, struct wl_if *wlif, void *p, int numpkt)
 
 void wl_txflowcontrol(struct wl_info *wl, struct wl_if *wlif, bool state, int prio)
 {
-	struct net_device *dev = wlif ? wlif->dev : wl->dev;
+	struct net_device *dev = (wlif ? wlif : wl->wlif)->dev;
 
+	if (!dev)
+		return;
 	if (state)
 		netif_stop_queue(dev);
 	else
@@ -428,18 +467,34 @@ void wl_event(struct wl_info *wl, char *ifname, struct wlc_event *e)
 
 void wl_event_sync(struct wl_info *wl, char *ifname, struct wlc_event *e) { }
 
+/*
+ * The core calls this when it creates a bsscfg (under the perimeter lock, from inside the ioctl
+ * that created it). The interface was allocated beforehand by wl_cfg_if_bss_create(); a bsscfg
+ * created some other way (e.g. "wl ssid -C 1" from the stock tool) is refused.
+ */
 struct wl_if *wl_add_if(struct wl_info *wl, struct wlc_if *wlcif, uint unit, struct ether_addr *remote)
 {
-	pr_warn("wl%d: virtual interface %u requested: not supported by this port yet\n",
-		PUB_UNIT(wl->pub), unit);
-	return NULL;
+	struct wl_if *ifp = wl->pending_if;
+
+	if (!ifp || remote) {
+		pr_warn("wl%d: virtual interface %u requested: only through cfg80211 (AP+STA)\n",
+			PUB_UNIT(wl->pub), unit);
+		return NULL;
+	}
+	wl->pending_if = NULL;
+	ifp->wlcif = wlcif;
+	return ifp;
 }
 
-void wl_del_if(struct wl_info *wl, struct wl_if *wlif) { }
+void wl_del_if(struct wl_info *wl, struct wl_if *wlif)
+{
+	if (wlif && wlif != wl->wlif)
+		wlif->wlcif = NULL;	/* the core freed the bsscfg; the wl_if stays with cfg80211 */
+}
 
 char *wl_ifname(struct wl_info *wl, struct wl_if *wlif)
 {
-	struct net_device *dev = wlif ? wlif->dev : wl->dev;
+	struct net_device *dev = (wlif ? wlif : wl->wlif)->dev;
 
 	return dev ? dev->name : "wl";
 }
@@ -490,36 +545,50 @@ static void wl_dpc(unsigned long data)
 
 /* ------------------------------------------------------------------ net_device */
 
+/* the radio is up while any of its interfaces is open */
 static int wl_open(struct net_device *dev)
 {
-	struct wl_info *wl = ((struct wl_if *)netdev_priv(dev))->wl;
-	int err;
+	struct wl_if *ifp = WLIF(dev);
+	struct wl_info *wl = ifp->wl;
+	int err = 0;
 
 	WL_LOCK(wl);
-	err = wl_up(wl);
+	if (!wl->n_open)
+		err = wl_up(wl);
+	if (!err) {
+		wl->n_open++;
+		ifp->open = TRUE;
+	}
 	WL_UNLOCK(wl);
 	if (err) {
 		netdev_err(dev, "wlc_up failed: %d\n", err);
 		return -ENODEV;
 	}
+	netif_carrier_on(dev);
 	netif_start_queue(dev);
 	return 0;
 }
 
 static int wl_close(struct net_device *dev)
 {
-	struct wl_info *wl = ((struct wl_if *)netdev_priv(dev))->wl;
+	struct wl_if *ifp = WLIF(dev);
+	struct wl_info *wl = ifp->wl;
 
 	netif_stop_queue(dev);
+	netif_carrier_off(dev);
 	WL_LOCK(wl);
-	wl_down(wl);
+	if (ifp->open) {
+		ifp->open = FALSE;
+		if (--wl->n_open == 0)
+			wl_down(wl);
+	}
 	WL_UNLOCK(wl);
 	return 0;
 }
 
 static netdev_tx_t wl_start(struct sk_buff *skb, struct net_device *dev)
 {
-	struct wl_if *wlif = netdev_priv(dev);
+	struct wl_if *wlif = WLIF(dev);
 	struct wl_info *wl = wlif->wl;
 	void *pkt;
 
@@ -538,6 +607,12 @@ static netdev_tx_t wl_start(struct sk_buff *skb, struct net_device *dev)
 	dev->stats.tx_packets++;
 	dev->stats.tx_bytes += skb->len;
 	WL_LOCK(wl);
+	if (!wlif->wlcif) {		/* BSS not created in the core (yet) */
+		WL_UNLOCK(wl);
+		PKTFREE(wl->osh, pkt, TRUE);
+		dev->stats.tx_dropped++;
+		return NETDEV_TX_OK;
+	}
 	wlc_sendpkt(wl->wlc, pkt, wlif->wlcif);	/* core owns pkt now, frees it via PKTFREE */
 	WL_UNLOCK(wl);
 	return NETDEV_TX_OK;
@@ -546,7 +621,7 @@ static netdev_tx_t wl_start(struct sk_buff *skb, struct net_device *dev)
 /* SIOCDEVPRIVATE: the Broadcom wl_ioctl_t protocol used by the stock `wl` tool */
 static int wl_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 {
-	struct wl_if *wlif = netdev_priv(dev);
+	struct wl_if *wlif = WLIF(dev);
 	struct wl_info *wl = wlif->wl;
 	wl_ioctl_t ioc;
 	void *buf = NULL;
@@ -581,8 +656,10 @@ static int wl_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 	if (trace_ioctl)
 		pr_info("wl ioctl %s cmd %d %s len %u set %u err %d\n", current->comm, ioc.cmd,
 			vname, ioc.len, ioc.set, err);
+	if (trace_ioctl > 1 && buf && ioc.len >= 8)	/* debugging only: never with real keys */
+		pr_info("wl ioctl %s cmd %d head %*ph\n", current->comm, ioc.cmd, 8, buf);
 	if (!err && ioc.cmd == WLC_SET_SSID && buf && ioc.len >= sizeof(wlc_ssid_t))
-		wl_cfg80211_ssid_changed(wl->cfg, ((wlc_ssid_t *)buf)->SSID,
+		wl_cfg80211_ssid_changed(wl->cfg, wlif, ((wlc_ssid_t *)buf)->SSID,
 					 min_t(uint32, ((wlc_ssid_t *)buf)->SSID_len, 32));
 	if (!err && buf && copy_to_user(ioc.buf, buf, ioc.len))
 		err = BCME_BADADDR;
@@ -593,13 +670,16 @@ static int wl_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 static int wl_set_mac_address(struct net_device *dev, void *addr)
 {
 	struct sockaddr *sa = addr;
-	struct wl_info *wl = ((struct wl_if *)netdev_priv(dev))->wl;
-	int err;
+	struct wl_if *ifp = WLIF(dev);
+	struct wl_info *wl = ifp->wl;
+	int err = 0;
 
 	if (!is_valid_ether_addr(sa->sa_data))
 		return -EADDRNOTAVAIL;
 	WL_LOCK(wl);
-	err = wlc_iovar_op(wl->wlc, "cur_etheraddr", NULL, 0, sa->sa_data, ETHER_ADDR_LEN, TRUE, NULL);
+	if (ifp->wlcif)		/* else applied when the bsscfg is created */
+		err = wlc_iovar_op(wl->wlc, "cur_etheraddr", NULL, 0, sa->sa_data, ETHER_ADDR_LEN,
+				   TRUE, ifp->wlcif);
 	WL_UNLOCK(wl);
 	if (err)
 		return -EINVAL;
@@ -632,53 +712,272 @@ static const struct net_device_ops wl_netdev_ops = {
 /* ------------------------------------------------------------------ helpers for wl_cfg80211.c */
 /* Process context: they may allocate with GFP_KERNEL and take the perimeter lock. */
 
-int wl_cfg_ioctl(struct wl_info *wl, int cmd, void *buf, int len)
+struct wl_if *wl_cfg_primary(struct wl_info *wl)
 {
+	return wl->wlif;
+}
+
+struct net_device *wl_cfg_if_dev(struct wl_if *ifp)
+{
+	return ifp->dev;
+}
+
+bool wl_cfg_if_has_bss(struct wl_if *ifp)
+{
+	return ifp->wlcif != NULL;
+}
+
+static struct net_device *wl_netdev_alloc(struct wl_if *ifp, const char *name,
+					  unsigned char name_assign_type)
+{
+	struct wl_info *wl = ifp->wl;
+	struct net_device *dev = alloc_netdev(sizeof(struct wl_if *), name, name_assign_type,
+					      ether_setup);
+
+	if (!dev)
+		return NULL;
+	*(struct wl_if **)netdev_priv(dev) = ifp;
+	dev->netdev_ops = &wl_netdev_ops;
+	dev->ethtool_ops = &wl_ethtool_ops;
+	dev->needed_headroom = WL_TXHEADROOM;
+	dev->base_addr = (unsigned long)wl->regsva;
+	dev->irq = wl->irq;
+	dev->needs_free_netdev = true;	/* freed by unregister_netdev(ice) */
+	SET_NETDEV_DEV(dev, &wl->core->dev);
+	return dev;
+}
+
+/* RTNL held (cfg80211 add_virtual_intf): allocate, then the caller sets ieee80211_ptr, then register */
+struct net_device *wl_cfg_netdev_alloc(struct wl_if *ifp, const char *name,
+				       unsigned char name_assign_type, const u8 *mac)
+{
+	struct net_device *dev;
+
+	if (ifp->dev)
+		return ERR_PTR(-EBUSY);
+	dev = wl_netdev_alloc(ifp, name, name_assign_type);
+	if (!dev)
+		return ERR_PTR(-ENOMEM);
+	memcpy(dev->dev_addr, mac, ETH_ALEN);
+	return dev;
+}
+
+int wl_cfg_netdev_register(struct wl_if *ifp, struct net_device *dev)
+{
+	struct wl_info *wl = ifp->wl;
 	int err;
 
+	ASSERT_RTNL();
+	err = register_netdevice(dev);
+	if (err) {
+		free_netdev(dev);
+		return err;
+	}
 	WL_LOCK(wl);
-	err = wlc_ioctl(wl->wlc, cmd, buf, len, wl->wlif->wlcif);
+	ifp->dev = dev;
 	WL_UNLOCK(wl);
+	return 0;
+}
+
+/* RTNL held (cfg80211 del_virtual_intf, detach) */
+void wl_cfg_netdev_destroy(struct wl_if *ifp)
+{
+	struct wl_info *wl = ifp->wl;
+	struct net_device *dev = ifp->dev;
+
+	ASSERT_RTNL();
+	if (!dev)
+		return;
+	if (dev->flags & IFF_UP)
+		dev_close(dev);
+	WL_LOCK(wl);
+	ifp->dev = NULL;		/* no more RX or flow control for it */
+	WL_UNLOCK(wl);
+	unregister_netdevice(dev);	/* frees it (needs_free_netdev) */
+}
+
+struct wl_if *wl_cfg_if_alloc(struct wl_info *wl)
+{
+	struct wl_if *ifp = kzalloc(sizeof(*ifp), GFP_KERNEL);
+
+	if (ifp)
+		ifp->wl = wl;
+	return ifp;
+}
+
+void wl_cfg_if_free(struct wl_if *ifp)
+{
+	kfree(ifp);
+}
+
+/* "bsscfg:<name>" iovar: int32 bsscfg index, then the value */
+static int wl_bssiovar_set(struct wl_info *wl, int idx, const char *name, const void *val, int len)
+{
+	int nlen = strlen("bsscfg:") + strlen(name) + 1;
+	u8 *buf = kzalloc(max_t(int, nlen + 4 + len, WLC_IOCTL_SMLEN), GFP_KERNEL);
+	int32 i = idx;
+	int err;
+
+	if (!buf)
+		return -ENOMEM;
+	snprintf(buf, nlen, "bsscfg:%s", name);
+	memcpy(buf + nlen, &i, 4);
+	memcpy(buf + nlen + 4, val, len);
+	WL_LOCK(wl);
+	err = wlc_ioctl(wl->wlc, WLC_SET_VAR, buf, nlen + 4 + len, wl->wlif->wlcif);
+	WL_UNLOCK(wl);
+	if (trace_ioctl || err)
+		pr_info("wl cfg bssiovar %s idx %d len %d err %d\n", buf, idx, len, err);
+	kfree(buf);
 	return err ? -EIO : 0;
 }
 
-int wl_cfg_iovar_getint(struct wl_info *wl, const char *name, int *val)
+/*
+ * The "bss" iovar takes the bsscfg index itself: { int32 idx, int32 val } (val 0 down, 1 up,
+ * 2 sta, 3 ap), as the stock wl sends "bss -C 1 up". The "bsscfg:" prefix form is refused
+ * (BCME_BUFTOOSHORT).
+ */
+static int wl_bss_set(struct wl_info *wl, int idx, int32 val)
 {
+	int32 p[2] = { idx, val };
+	u8 *buf = kzalloc(WLC_IOCTL_SMLEN, GFP_KERNEL);
 	int err;
 
+	if (!buf)
+		return -ENOMEM;
+	memcpy(buf, "bss", 4);
+	memcpy(buf + 4, p, sizeof(p));
 	WL_LOCK(wl);
-	err = wlc_iovar_getint(wl->wlc, name, val);
+	err = wlc_ioctl(wl->wlc, WLC_SET_VAR, buf, 4 + sizeof(p), wl->wlif->wlcif);
 	WL_UNLOCK(wl);
+	if (trace_ioctl || err)
+		pr_info("wl cfg bss idx %d val %d err %d\n", idx, val, err);
+	kfree(buf);
 	return err ? -EIO : 0;
 }
 
-int wl_cfg_iovar_setint(struct wl_info *wl, const char *name, int val)
+/*
+ * Create the core's bsscfg idx for ifp. Setting its SSID makes the core allocate the bsscfg and call
+ * wl_add_if() synchronously, which picks up ifp from pending_if. The real SSID comes with start_ap.
+ */
+int wl_cfg_if_bss_create(struct wl_if *ifp, int idx, const u8 *mac)
 {
+	struct wl_info *wl = ifp->wl;
+	wlc_ssid_t ssid;
 	int err;
 
+	if (ifp->wlcif)
+		return 0;
+	memset(&ssid, 0, sizeof(ssid));
+	ssid.SSID_len = 1;
+	ssid.SSID[0] = '-';
 	WL_LOCK(wl);
-	err = wlc_iovar_setint(wl->wlc, name, val);
+	wl->pending_if = ifp;
 	WL_UNLOCK(wl);
+	err = wl_bssiovar_set(wl, idx, "ssid", &ssid, sizeof(ssid));
+	WL_LOCK(wl);
+	wl->pending_if = NULL;
+	WL_UNLOCK(wl);
+	if (!err && !ifp->wlcif)
+		err = -ENODEV;
+	if (err)
+		return err;
+	wl_bss_set(wl, idx, 3);	/* make it an AP */
+	if (mac)
+		wl_bssiovar_set(wl, idx, "cur_etheraddr", mac, ETHER_ADDR_LEN);
+	return 0;
+}
+
+/*
+ * Every core call goes through a heap buffer of at least WLC_IOCTL_SMLEN bytes, and only len bytes
+ * are copied back. Some queries return more than the structures in our headers describe (a STA-mode
+ * query overran a stack buffer: "stack-protector: Kernel stack is corrupted"), and the stock glue
+ * also always hands the core at least that much.
+ */
+#define WL_CFG_BOUNCE_MIN	WLC_IOCTL_SMLEN
+
+int wl_cfg_ioctl(struct wl_if *ifp, int cmd, void *buf, int len)
+{
+	struct wl_info *wl = ifp->wl;
+	int blen = max_t(int, len, WL_CFG_BOUNCE_MIN);
+	u8 *b;
+	int err;
+
+	if (!ifp->wlcif)
+		return -ENODEV;
+	b = kzalloc(blen, GFP_KERNEL);
+	if (!b)
+		return -ENOMEM;
+	if (buf && len > 0)
+		memcpy(b, buf, len);
+	WL_LOCK(wl);
+	err = wlc_ioctl(wl->wlc, cmd, buf ? b : NULL, len, ifp->wlcif);
+	WL_UNLOCK(wl);
+	if (trace_ioctl)
+		pr_info("wl cfg ioctl cmd %d len %d err %d (%s)\n", cmd, len, err,
+			ifp == wl->wlif ? "bss 0" : "bss 1");
+	if (!err && buf && len > 0)
+		memcpy(buf, b, len);
+	kfree(b);
 	return err ? -EIO : 0;
 }
 
-int wl_cfg_channel(struct wl_info *wl, int *chan)
+static int wl_cfg_iovar(struct wl_if *ifp, const char *name, void *params, int plen, void *arg,
+			int len, bool set)
+{
+	struct wl_info *wl = ifp->wl;
+	int blen = max_t(int, len, WL_CFG_BOUNCE_MIN);
+	u8 *b;
+	int err;
+
+	if (!ifp->wlcif)
+		return -ENODEV;
+	b = kzalloc(blen, GFP_KERNEL);
+	if (!b)
+		return -ENOMEM;
+	if (arg && len > 0)
+		memcpy(b, arg, len);
+	WL_LOCK(wl);
+	err = wlc_iovar_op(wl->wlc, name, params, plen, b, len, set, ifp->wlcif);
+	WL_UNLOCK(wl);
+	if (!err && !set && arg && len > 0)
+		memcpy(arg, b, len);
+	kfree(b);
+	return err ? -EIO : 0;
+}
+
+int wl_cfg_iovar_getint(struct wl_if *ifp, const char *name, int *val)
+{
+	return wl_cfg_iovar(ifp, name, NULL, 0, val, sizeof(*val), FALSE);
+}
+
+int wl_cfg_iovar_setint(struct wl_if *ifp, const char *name, int val)
+{
+	return wl_cfg_iovar(ifp, name, NULL, 0, &val, sizeof(val), TRUE);
+}
+
+static int wl_cfg_setint(struct wl_if *ifp, int cmd, int val)
+{
+	return wl_cfg_ioctl(ifp, cmd, &val, sizeof(val));
+}
+
+int wl_cfg_channel(struct wl_if *ifp, int *chan)
 {
 	channel_info_t ci;
-	int err = wl_cfg_ioctl(wl, WLC_GET_CHANNEL, &ci, sizeof(ci));
+	int err = wl_cfg_ioctl(ifp, WLC_GET_CHANNEL, &ci, sizeof(ci));
 
 	if (!err)
 		*chan = ci.hw_channel;
 	return err;
 }
 
-int wl_cfg_valid_channels(struct wl_info *wl, u32 *chans, int max)
+int wl_cfg_valid_channels(struct wl_if *ifp, u32 *chans, int max)
 {
 	uint buf[1 + 64];	/* wl_uint32_list_t */
 	int i, n, err;
 
 	buf[0] = 64;
-	err = wl_cfg_ioctl(wl, WLC_GET_VALID_CHANNELS, buf, sizeof(buf));
+	err = wl_cfg_ioctl(ifp, WLC_GET_VALID_CHANNELS, buf, sizeof(buf));
 	if (err)
 		return err;
 	n = min_t(int, buf[0], max);
@@ -687,7 +986,7 @@ int wl_cfg_valid_channels(struct wl_info *wl, u32 *chans, int max)
 	return n;
 }
 
-int wl_cfg_assoclist(struct wl_info *wl, u8 (*macs)[6], int max)
+int wl_cfg_assoclist(struct wl_if *ifp, u8 (*macs)[6], int max)
 {
 	int i, n, err, len = sizeof(uint) + max * ETHER_ADDR_LEN;
 	struct maclist *ml = kmalloc(len, GFP_KERNEL);
@@ -695,7 +994,7 @@ int wl_cfg_assoclist(struct wl_info *wl, u8 (*macs)[6], int max)
 	if (!ml)
 		return -ENOMEM;
 	ml->count = max;
-	err = wl_cfg_ioctl(wl, WLC_GET_ASSOCLIST, ml, len);
+	err = wl_cfg_ioctl(ifp, WLC_GET_ASSOCLIST, ml, len);
 	n = err ? err : min_t(int, ml->count, max);
 	for (i = 0; i < n; i++)
 		memcpy(macs[i], &ml->ea[i], ETHER_ADDR_LEN);
@@ -703,7 +1002,7 @@ int wl_cfg_assoclist(struct wl_info *wl, u8 (*macs)[6], int max)
 	return n;
 }
 
-int wl_cfg_sta_info(struct wl_info *wl, const u8 *mac, struct wl_cfg_sta *st)
+int wl_cfg_sta_info(struct wl_if *ifp, const u8 *mac, struct wl_cfg_sta *st)
 {
 	sta_info_t *si = kzalloc(WLC_IOCTL_SMLEN, GFP_KERNEL);
 	struct ether_addr ea;
@@ -713,10 +1012,7 @@ int wl_cfg_sta_info(struct wl_info *wl, const u8 *mac, struct wl_cfg_sta *st)
 	if (!si)
 		return -ENOMEM;
 	memcpy(&ea, mac, ETHER_ADDR_LEN);
-	WL_LOCK(wl);
-	err = wlc_iovar_op(wl->wlc, "sta_info", &ea, ETHER_ADDR_LEN, si, WLC_IOCTL_SMLEN, FALSE,
-			   wl->wlif->wlcif);
-	WL_UNLOCK(wl);
+	err = wl_cfg_iovar(ifp, "sta_info", &ea, ETHER_ADDR_LEN, si, WLC_IOCTL_SMLEN, FALSE);
 	if (err) {
 		kfree(si);
 		return -ENOENT;
@@ -739,101 +1035,162 @@ int wl_cfg_sta_info(struct wl_info *wl, const u8 *mac, struct wl_cfg_sta *st)
 	}
 	kfree(si);
 
+	/* AP mode: that station's RSSI; STA mode: the AP's (with the zero address too) */
 	memset(&sv, 0, sizeof(sv));
 	memcpy(&sv.ea, mac, ETHER_ADDR_LEN);
-	if (!wl_cfg_ioctl(wl, WLC_GET_RSSI, &sv, sizeof(sv)))
+	if (!wl_cfg_ioctl(ifp, WLC_GET_RSSI, &sv, sizeof(sv)))
 		st->rssi = (int32)sv.val;
+	if (!st->rssi) {
+		memset(&sv, 0, sizeof(sv));
+		if (!wl_cfg_ioctl(ifp, WLC_GET_RSSI, &sv, sizeof(sv)))
+			st->rssi = (int32)sv.val;
+	}
 	return 0;
 }
 
-int wl_cfg_noise(struct wl_info *wl, int *dbm)
+int wl_cfg_noise(struct wl_if *ifp, int *dbm)
 {
 	int32 v;
-	int err = wl_cfg_ioctl(wl, WLC_GET_PHY_NOISE, &v, sizeof(v));
+	int err = wl_cfg_ioctl(ifp, WLC_GET_PHY_NOISE, &v, sizeof(v));
 
 	if (!err)
 		*dbm = v;
 	return err;
 }
 
-static int wl_cfg_setint(struct wl_info *wl, int cmd, int val)
-{
-	return wl_cfg_ioctl(wl, cmd, &val, sizeof(val));
-}
-
 /*
- * The core only queues events whose bit is set in "event_msgs"; nas used to set them. Add the
- * station events cfg80211 needs, keeping whatever else is enabled.
+ * The core only queues events whose bit is set in "event_msgs"; nas used to set them. Add the ones
+ * cfg80211 needs (AP stations, STA join/link/supplicant, scan), keeping whatever else is enabled.
  */
 static int wl_cfg_enable_events(struct wl_info *wl)
 {
-	static const int ev[] = { WLC_E_DEAUTH, WLC_E_DEAUTH_IND, WLC_E_ASSOC_IND, WLC_E_REASSOC_IND,
-				  WLC_E_DISASSOC, WLC_E_DISASSOC_IND };
+	static const int ev[] = { WLC_E_SET_SSID, WLC_E_DEAUTH, WLC_E_DEAUTH_IND, WLC_E_ASSOC_IND,
+				  WLC_E_REASSOC_IND, WLC_E_DISASSOC, WLC_E_DISASSOC_IND, WLC_E_LINK,
+				  WLC_E_SCAN_COMPLETE, WLC_E_PSK_SUP };
 	u8 mask[WL_EVENTING_MASK_LEN];
 	int i, err;
 
-	WL_LOCK(wl);
-	err = wlc_iovar_op(wl->wlc, "event_msgs", NULL, 0, mask, sizeof(mask), FALSE, wl->wlif->wlcif);
+	err = wl_cfg_iovar(wl->wlif, "event_msgs", NULL, 0, mask, sizeof(mask), FALSE);
 	if (!err) {
 		for (i = 0; i < ARRAY_SIZE(ev); i++)
 			mask[ev[i] / 8] |= 1 << (ev[i] % 8);
-		err = wlc_iovar_op(wl->wlc, "event_msgs", NULL, 0, mask, sizeof(mask), TRUE,
-				   wl->wlif->wlcif);
+		err = wl_cfg_iovar(wl->wlif, "event_msgs", NULL, 0, mask, sizeof(mask), TRUE);
 	}
-	WL_UNLOCK(wl);
-	return err ? -EIO : 0;
+	return err;
 }
 
-/* same sequence as brcmwl.sh, which is known to work with this core */
-int wl_cfg_start_ap(struct wl_info *wl, const struct wl_cfg_ap *ap)
+/*
+ * Radio mode. AP: the primary bsscfg is an AP (ap 1, apsta 0), as brcmwl.sh sets it up.
+ * STA: ap 0. AP+STA: apsta 1, which makes the primary bsscfg the STA; AP bsscfgs are added with
+ * wl_cfg_if_bss_create() and follow the STA's channel. Changing it needs the radio down.
+ */
+int wl_cfg_set_mode(struct wl_info *wl, bool primary_sta, bool apsta)
 {
-	int wsec = ((ap->wsec & WL_CFG_WSEC_WEP) ? WEP_ENABLED : 0) |
-		   ((ap->wsec & WL_CFG_WSEC_TKIP) ? TKIP_ENABLED : 0) |
-		   ((ap->wsec & WL_CFG_WSEC_AES) ? AES_ENABLED : 0);
-	int wpa_auth = ((ap->auth & WL_CFG_AUTH_WPA_PSK) ? WPA_AUTH_PSK : 0) |
-		       ((ap->auth & WL_CFG_AUTH_WPA2_PSK) ? WPA2_AUTH_PSK : 0) |
-		       ((ap->auth & WL_CFG_AUTH_WPA_8021X) ? WPA_AUTH_UNSPECIFIED : 0) |
-		       ((ap->auth & WL_CFG_AUTH_WPA2_8021X) ? WPA2_AUTH_UNSPECIFIED : 0);
-	bool eap = ap->auth & (WL_CFG_AUTH_WPA_8021X | WL_CFG_AUTH_WPA2_8021X);
-	wlc_ssid_t ssid;
+	struct wl_if *ifp = wl->wlif;
 	int err;
+
+	/*
+	 * Always the full sequence: after a module load the core is ap 0 but also infra 0 (IBSS),
+	 * so "already a STA" is not a safe shortcut (it joined as Ad Hoc).
+	 */
+	err = wl_cfg_ioctl(ifp, WLC_DOWN, NULL, 0);
+	if (nompc)
+		err = err ?: wl_cfg_iovar_setint(ifp, "mpc", 0);
+	/*
+	 * mbss: without it the receive address match only covers the primary MAC, so a secondary AP
+	 * beacons and answers broadcast probes but never sees frames sent to its BSSID (clients time
+	 * out at authentication). Its BSSIDs must then follow the MBSS pattern (wl_cfg80211.c).
+	 */
+	if (apsta) {
+		err = err ?: wl_cfg_iovar_setint(ifp, "apsta", 1);
+		err = err ?: wl_cfg_iovar_setint(ifp, "mbss", 1);
+	} else {
+		err = err ?: wl_cfg_iovar_setint(ifp, "mbss", 0);
+		err = err ?: wl_cfg_iovar_setint(ifp, "apsta", 0);
+		err = err ?: wl_cfg_setint(ifp, WLC_SET_AP, !primary_sta);
+	}
+	err = err ?: wl_cfg_setint(ifp, WLC_SET_INFRA, 1);
+	if (!err && nompc)		/* the mode change set it back to 1 */
+		err = wl_cfg_iovar_setint(ifp, "mpc", 0);
+	err = err ?: wl_cfg_enable_events(wl);
+	if (!err && wl->n_open)
+		err = wl_cfg_ioctl(ifp, WLC_UP, NULL, 0);
+	return err;
+}
+
+static void wl_cfg_sec(u32 wsec_in, u32 auth_in, int *wsec, int *wpa_auth)
+{
+	*wsec = ((wsec_in & WL_CFG_WSEC_WEP) ? WEP_ENABLED : 0) |
+		((wsec_in & WL_CFG_WSEC_TKIP) ? TKIP_ENABLED : 0) |
+		((wsec_in & WL_CFG_WSEC_AES) ? AES_ENABLED : 0);
+	*wpa_auth = ((auth_in & WL_CFG_AUTH_WPA_PSK) ? WPA_AUTH_PSK : 0) |
+		    ((auth_in & WL_CFG_AUTH_WPA2_PSK) ? WPA2_AUTH_PSK : 0) |
+		    ((auth_in & WL_CFG_AUTH_WPA_8021X) ? WPA_AUTH_UNSPECIFIED : 0) |
+		    ((auth_in & WL_CFG_AUTH_WPA2_8021X) ? WPA2_AUTH_UNSPECIFIED : 0);
+}
+
+/*
+ * AP on the primary bsscfg: the same sequence as brcmwl.sh, known to work with this core.
+ * AP on a secondary bsscfg (AP+STA): security per bsscfg, channel and beacon timing come from the
+ * radio (the STA), and the BSS is brought up with the "bss" iovar instead of WLC_UP.
+ */
+int wl_cfg_start_ap(struct wl_if *ifp, const struct wl_cfg_ap *ap)
+{
+	struct wl_info *wl = ifp->wl;
+	bool primary = ifp == wl->wlif;
+	bool eap = ap->auth & (WL_CFG_AUTH_WPA_8021X | WL_CFG_AUTH_WPA2_8021X);
+	int wsec, wpa_auth, err;
+	wlc_ssid_t ssid;
 
 	if (ap->ssid_len < 0 || ap->ssid_len > sizeof(ssid.SSID))
 		return -EINVAL;
-	err = wl_cfg_ioctl(wl, WLC_DOWN, NULL, 0);
-	if (nompc)
-		err = err ?: wl_cfg_iovar_setint(wl, "mpc", 0);
-	err = err ?: wl_cfg_setint(wl, WLC_SET_AP, 1);
-	err = err ?: wl_cfg_setint(wl, WLC_SET_INFRA, 1);
-	err = err ?: wl_cfg_setint(wl, WLC_SET_CHANNEL, ap->channel);
-	if (!err && ap->beacon_int)
-		err = wl_cfg_setint(wl, WLC_SET_BCNPRD, ap->beacon_int);
-	if (!err && ap->dtim)
-		err = wl_cfg_setint(wl, WLC_SET_DTIMPRD, ap->dtim);
-	err = err ?: wl_cfg_setint(wl, WLC_SET_CLOSED, ap->hidden);
-	err = err ?: wl_cfg_setint(wl, WLC_SET_AUTH, ap->shared_key ? 1 : 0);
-	err = err ?: wl_cfg_setint(wl, WLC_SET_WSEC, wsec);
-	err = err ?: wl_cfg_setint(wl, WLC_SET_WPA_AUTH, wpa_auth);
-	err = err ?: wl_cfg_iovar_setint(wl, "wsec_restrict", wpa_auth || wsec ? 1 : 0);
-	err = err ?: wl_cfg_setint(wl, WLC_SET_EAP_RESTRICT, eap);
-	if (!err && ap->inactivity_s > 0 && wl_cfg_iovar_setint(wl, "scb_activity_time", ap->inactivity_s))
-		pr_warn("%s: could not set scb_activity_time %d\n", wl->dev->name, ap->inactivity_s);
+	wl_cfg_sec(ap->wsec, ap->auth, &wsec, &wpa_auth);
+	if (primary) {
+		err = wl_cfg_ioctl(ifp, WLC_DOWN, NULL, 0);
+		if (nompc)
+			err = err ?: wl_cfg_iovar_setint(ifp, "mpc", 0);
+		err = err ?: wl_cfg_iovar_setint(ifp, "apsta", 0);
+		err = err ?: wl_cfg_setint(ifp, WLC_SET_AP, 1);
+		err = err ?: wl_cfg_setint(ifp, WLC_SET_INFRA, 1);
+		err = err ?: wl_cfg_setint(ifp, WLC_SET_CHANNEL, ap->channel);
+		if (!err && ap->beacon_int)
+			err = wl_cfg_setint(ifp, WLC_SET_BCNPRD, ap->beacon_int);
+		if (!err && ap->dtim)
+			err = wl_cfg_setint(ifp, WLC_SET_DTIMPRD, ap->dtim);
+	} else {
+		wl_bss_set(wl, 1, 0);	/* down first; fails harmlessly if it already is */
+		err = 0;
+	}
+	err = err ?: wl_cfg_setint(ifp, WLC_SET_CLOSED, ap->hidden);
+	err = err ?: wl_cfg_setint(ifp, WLC_SET_AUTH, ap->shared_key ? 1 : 0);
+	err = err ?: wl_cfg_setint(ifp, WLC_SET_WSEC, wsec);
+	err = err ?: wl_cfg_setint(ifp, WLC_SET_WPA_AUTH, wpa_auth);
+	err = err ?: wl_cfg_iovar_setint(ifp, "wsec_restrict", wpa_auth || wsec ? 1 : 0);
+	err = err ?: wl_cfg_setint(ifp, WLC_SET_EAP_RESTRICT, eap);
+	if (!err && ap->inactivity_s > 0 && wl_cfg_iovar_setint(ifp, "scb_activity_time", ap->inactivity_s))
+		pr_warn("wl: could not set scb_activity_time %d\n", ap->inactivity_s);
 	err = err ?: wl_cfg_enable_events(wl);
-	err = err ?: wl_cfg_ioctl(wl, WLC_UP, NULL, 0);
+	if (primary)
+		err = err ?: wl_cfg_ioctl(ifp, WLC_UP, NULL, 0);
 	if (err)
 		return err;
 	memset(&ssid, 0, sizeof(ssid));
 	ssid.SSID_len = ap->ssid_len;
 	memcpy(ssid.SSID, ap->ssid, ap->ssid_len);
-	return wl_cfg_ioctl(wl, WLC_SET_SSID, &ssid, sizeof(ssid));
+	if (primary)
+		return wl_cfg_ioctl(ifp, WLC_SET_SSID, &ssid, sizeof(ssid));
+	err = wl_bssiovar_set(wl, 1, "ssid", &ssid, sizeof(ssid));
+	return err ?: wl_bss_set(wl, 1, 1);
 }
 
-int wl_cfg_stop_ap(struct wl_info *wl)
+int wl_cfg_stop_ap(struct wl_if *ifp)
 {
-	return wl_cfg_ioctl(wl, WLC_DOWN, NULL, 0);
+	if (ifp == ifp->wl->wlif)
+		return wl_cfg_ioctl(ifp, WLC_DOWN, NULL, 0);
+	return wl_bss_set(ifp->wl, 1, 0);
 }
 
-int wl_cfg_set_key(struct wl_info *wl, int idx, const u8 *mac, enum wl_cfg_cipher cipher,
+int wl_cfg_set_key(struct wl_if *ifp, int idx, const u8 *mac, enum wl_cfg_cipher cipher,
 		   const u8 *key, int key_len, bool primary)
 {
 	static const uint32 algo[] = {
@@ -853,10 +1210,10 @@ int wl_cfg_set_key(struct wl_info *wl, int idx, const u8 *mac, enum wl_cfg_ciphe
 		memcpy(&k.ea, mac, ETHER_ADDR_LEN);	/* AP mode: TKIP MIC keys are not swapped */
 	else if (primary)
 		k.flags = WL_PRIMARY_KEY;
-	return wl_cfg_ioctl(wl, WLC_SET_KEY, &k, sizeof(k));
+	return wl_cfg_ioctl(ifp, WLC_SET_KEY, &k, sizeof(k));
 }
 
-int wl_cfg_del_key(struct wl_info *wl, int idx, const u8 *mac)
+int wl_cfg_del_key(struct wl_if *ifp, int idx, const u8 *mac)
 {
 	wl_wsec_key_t k;
 
@@ -864,72 +1221,287 @@ int wl_cfg_del_key(struct wl_info *wl, int idx, const u8 *mac)
 	k.index = idx;
 	if (mac)
 		memcpy(&k.ea, mac, ETHER_ADDR_LEN);
-	return wl_cfg_ioctl(wl, WLC_SET_KEY, &k, sizeof(k));
+	return wl_cfg_ioctl(ifp, WLC_SET_KEY, &k, sizeof(k));
 }
 
 /* group key TSC/PN, least significant byte first (as nas reads it for the GTK RSC) */
-int wl_cfg_key_seq(struct wl_info *wl, int idx, u8 seq[6])
+int wl_cfg_key_seq(struct wl_if *ifp, int idx, u8 seq[6])
 {
 	union { int32 idx; u8 b[8]; } buf;
 	int err;
 
 	memset(&buf, 0, sizeof(buf));
 	buf.idx = idx;
-	err = wl_cfg_ioctl(wl, WLC_GET_KEY_SEQ, &buf, sizeof(buf));
+	err = wl_cfg_ioctl(ifp, WLC_GET_KEY_SEQ, &buf, sizeof(buf));
 	if (!err)
 		memcpy(seq, buf.b, 6);
 	return err;
 }
 
-int wl_cfg_authorize(struct wl_info *wl, const u8 *mac, bool authorized)
+int wl_cfg_authorize(struct wl_if *ifp, const u8 *mac, bool authorized)
 {
 	struct ether_addr ea;
 
 	memcpy(&ea, mac, ETHER_ADDR_LEN);
-	return wl_cfg_ioctl(wl, authorized ? WLC_SCB_AUTHORIZE : WLC_SCB_DEAUTHORIZE, &ea, sizeof(ea));
+	return wl_cfg_ioctl(ifp, authorized ? WLC_SCB_AUTHORIZE : WLC_SCB_DEAUTHORIZE, &ea, sizeof(ea));
 }
 
-int wl_cfg_deauth(struct wl_info *wl, const u8 *mac, int reason)
+int wl_cfg_deauth(struct wl_if *ifp, const u8 *mac, int reason)
 {
 	scb_val_t sv;
 
 	memset(&sv, 0, sizeof(sv));
 	sv.val = reason;
 	memcpy(&sv.ea, mac, ETHER_ADDR_LEN);
-	return wl_cfg_ioctl(wl, WLC_SCB_DEAUTHENTICATE_FOR_REASON, &sv, sizeof(sv));
+	return wl_cfg_ioctl(ifp, WLC_SCB_DEAUTHENTICATE_FOR_REASON, &sv, sizeof(sv));
 }
 
-int wl_cfg_ssid(struct wl_info *wl, u8 *ssid, int *len)
+/* ---- station side ---- */
+
+/*
+ * Join. With a PMK, the core's own supplicant does the 4-way and group handshakes (sup_wpa 1, raw
+ * 32-byte PMK); success is reported as WLC_E_PSK_SUP "keyed". Without one,
+ * an external supplicant does them and installs keys with add_key (sup_wpa 0, its IE via "wpaie").
+ */
+int wl_cfg_join(struct wl_if *ifp, const struct wl_cfg_join *j)
 {
-	wlc_ssid_t s;
-	int err = wl_cfg_ioctl(wl, WLC_GET_SSID, &s, sizeof(s));
+	int wsec, wpa_auth, err;
+	const char *step;
+	wlc_ssid_t ssid;
+
+	if (j->ssid_len < 0 || j->ssid_len > sizeof(ssid.SSID))
+		return -EINVAL;
+	wl_cfg_sec(j->wsec, j->auth, &wsec, &wpa_auth);
+	/* infra/ap are set by wl_cfg_set_mode(): the core refuses WLC_SET_INFRA while up */
+	step = "auth";
+	err = wl_cfg_setint(ifp, WLC_SET_AUTH, j->shared_key ? 1 : 0);
+	if (!err) {
+		step = "wsec";
+		err = wl_cfg_setint(ifp, WLC_SET_WSEC, wsec);
+	}
+	if (!err) {
+		step = "wpa_auth";
+		err = wl_cfg_setint(ifp, WLC_SET_WPA_AUTH, wpa_auth);
+	}
+	if (!err) {
+		step = "sup_wpa";
+		err = wl_cfg_iovar_setint(ifp, "sup_wpa", j->pmk ? 1 : 0);
+	}
+	if (!err && j->pmk) {
+		/*
+		 * wsec_pmk_t with the PMK as 32 binary bytes (key_len 32, flags 0). This core rejects the
+		 * 64-hex-digit form that newer firmware (and brcmfmac) uses; the stock wl's set_pmk only
+		 * ever sends a passphrase (flags WSEC_PASSPHRASE). Tested with wl-port/d0/pmktest.c.
+		 */
+		union { wsec_pmk_t pmk; u8 raw[128]; } b;
+
+		step = "pmk";
+		memset(&b, 0, sizeof(b));
+		memcpy(b.pmk.key, j->pmk, 32);
+		b.pmk.key_len = 32;
+		b.pmk.flags = 0;
+		err = wl_cfg_ioctl(ifp, WLC_SET_WSEC_PMK, &b, sizeof(b.pmk));
+		memzero_explicit(&b, sizeof(b));
+	} else if (!err && j->wpaie && j->wpaie_len > 0) {
+		step = "wpaie";
+		err = wl_cfg_iovar(ifp, "wpaie", NULL, 0, (void *)j->wpaie, j->wpaie_len, TRUE);
+	}
+	if (!err) {
+		step = "ssid";
+		memset(&ssid, 0, sizeof(ssid));
+		ssid.SSID_len = j->ssid_len;
+		memcpy(ssid.SSID, j->ssid, j->ssid_len);
+		err = wl_cfg_ioctl(ifp, WLC_SET_SSID, &ssid, sizeof(ssid));
+	}
+	if (err)
+		pr_warn("wl: join failed at %s: %d\n", step, err);
+	return err;
+}
+
+int wl_cfg_disassoc(struct wl_if *ifp)
+{
+	return wl_cfg_ioctl(ifp, WLC_DISASSOC, NULL, 0);
+}
+
+int wl_cfg_bssid(struct wl_if *ifp, u8 bssid[6])
+{
+	struct ether_addr ea;
+	int err = wl_cfg_ioctl(ifp, WLC_GET_BSSID, &ea, sizeof(ea));
 
 	if (err)
+		return -ENOTCONN;
+	memcpy(bssid, &ea, ETHER_ADDR_LEN);
+	return is_zero_ether_addr(bssid) ? -ENOTCONN : 0;
+}
+
+static void wl_cfg_bss_conv(const wl_bss_info_t *bi, struct wl_cfg_bss *b)
+{
+	memcpy(b->bssid, &bi->BSSID, ETHER_ADDR_LEN);
+	b->channel = bi->n_cap && bi->ctl_ch ? bi->ctl_ch : CHSPEC_CHANNEL(bi->chanspec);
+	b->capability = bi->capability;
+	b->beacon_period = bi->beacon_period;
+	b->rssi = bi->RSSI;
+	b->ies = (const u8 *)bi + bi->ie_offset;
+	b->ies_len = bi->ie_length;
+}
+
+#define WL_BSS_BUF_LEN	2048
+#define WL_SCAN_BUF_LEN	(32 * 1024)
+
+int wl_cfg_cur_bss(struct wl_if *ifp, void (*cb)(void *ctx, const struct wl_cfg_bss *), void *ctx)
+{
+	u8 *buf = kzalloc(WL_BSS_BUF_LEN, GFP_KERNEL);
+	wl_bss_info_t *bi = (wl_bss_info_t *)(buf + 4);
+	struct wl_cfg_bss b;
+	int err;
+
+	if (!buf)
+		return -ENOMEM;
+	*(uint32 *)buf = WL_BSS_BUF_LEN;
+	err = wl_cfg_ioctl(ifp, WLC_GET_BSS_INFO, buf, WL_BSS_BUF_LEN);
+	if (!err && (bi->version != WL_BSS_INFO_VERSION ||
+		     bi->ie_offset + bi->ie_length > WL_BSS_BUF_LEN - 4))
+		err = -EINVAL;
+	if (!err) {
+		wl_cfg_bss_conv(bi, &b);
+		cb(ctx, &b);
+	}
+	kfree(buf);
+	return err;
+}
+
+int wl_cfg_assoc_ies(struct wl_if *ifp, u8 **req, u32 *req_len, u8 **resp, u32 *resp_len)
+{
+	wl_assoc_info_t ai;
+	int err;
+
+	*req = *resp = NULL;
+	*req_len = *resp_len = 0;
+	err = wl_cfg_iovar(ifp, "assoc_info", NULL, 0, &ai, sizeof(ai), FALSE);
+	if (err)
 		return err;
-	*len = min_t(uint32, s.SSID_len, sizeof(s.SSID));
-	memcpy(ssid, s.SSID, *len);
+	if (ai.req_len > 4 * 1024 || ai.resp_len > 4 * 1024)
+		return -EINVAL;
+	if (ai.req_len) {
+		*req = kzalloc(ai.req_len, GFP_KERNEL);
+		if (*req && !wl_cfg_iovar(ifp, "assoc_req_ies", NULL, 0, *req, ai.req_len, FALSE))
+			*req_len = ai.req_len;
+	}
+	if (ai.resp_len) {
+		*resp = kzalloc(ai.resp_len, GFP_KERNEL);
+		if (*resp && !wl_cfg_iovar(ifp, "assoc_resp_ies", NULL, 0, *resp, ai.resp_len, FALSE))
+			*resp_len = ai.resp_len;
+	}
+	return 0;
+}
+
+int wl_cfg_scan(struct wl_if *ifp, const u8 *ssid, int ssid_len)
+{
+	wl_scan_params_t sp;
+
+	if (ssid_len < 0 || ssid_len > sizeof(sp.ssid.SSID))
+		return -EINVAL;
+	memset(&sp, 0, sizeof(sp));
+	sp.ssid.SSID_len = ssid_len;
+	memcpy(sp.ssid.SSID, ssid, ssid_len);
+	memset(&sp.bssid, 0xff, ETHER_ADDR_LEN);
+	sp.bss_type = DOT11_BSSTYPE_ANY;
+	sp.scan_type = 0;		/* active */
+	sp.nprobes = -1;
+	sp.active_time = -1;
+	sp.passive_time = -1;
+	sp.home_time = -1;
+	sp.channel_num = 0;		/* all valid channels */
+	return wl_cfg_ioctl(ifp, WLC_SCAN, &sp, WL_SCAN_PARAMS_FIXED_SIZE);
+}
+
+int wl_cfg_scan_results(struct wl_if *ifp, void (*cb)(void *ctx, const struct wl_cfg_bss *),
+			void *ctx)
+{
+	wl_scan_results_t *r = kzalloc(WL_SCAN_BUF_LEN, GFP_KERNEL);
+	const u8 *p, *end;
+	struct wl_cfg_bss b;
+	uint32 i;
+	int err;
+
+	if (!r)
+		return -ENOMEM;
+	r->buflen = WL_SCAN_BUF_LEN;
+	err = wl_cfg_ioctl(ifp, WLC_SCAN_RESULTS, r, WL_SCAN_BUF_LEN);
+	if (err)
+		goto out;
+	p = (const u8 *)r->bss_info;
+	end = (const u8 *)r + min_t(uint32, r->buflen, WL_SCAN_BUF_LEN);
+	for (i = 0; i < r->count; i++) {
+		const wl_bss_info_t *bi = (const wl_bss_info_t *)p;
+
+		if (p + sizeof(*bi) > end || bi->length < sizeof(*bi) || p + bi->length > end)
+			break;
+		if (bi->version == WL_BSS_INFO_VERSION && bi->ie_offset + bi->ie_length <= bi->length) {
+			wl_cfg_bss_conv(bi, &b);
+			cb(ctx, &b);
+		}
+		p += bi->length;
+	}
+out:
+	kfree(r);
+	return err;
+}
+
+extern char *nvram_get(const char *name);	/* osl/linux_osl_414.c */
+
+/*
+ * The core has no "current TX power" query on this chip; with no user limit set it transmits at the
+ * board maximum (per chain, minus per-rate offsets), capped by its country rules. The maximum is in
+ * the SROM-format variables the core itself reads; on the BCM5357 they live in NVRAM under sb/1/.
+ */
+int wl_cfg_board_maxpower(struct wl_if *ifp, int *qdbm)
+{
+	static const char * const pfx[] = { "sb/1/", "" };
+	char name[24], *v;
+	int i, c, best = 0;
+	unsigned long q;
+
+	for (i = 0; i < ARRAY_SIZE(pfx) && !best; i++) {
+		for (c = 0; c < 2; c++) {
+			snprintf(name, sizeof(name), "%smaxp2ga%d", pfx[i], c);
+			v = nvram_get(name);
+			if (v && !kstrtoul(v, 0, &q) && q > best && q < 0xff)
+				best = q;
+		}
+	}
+	if (!best)
+		return -ENODATA;
+	*qdbm = best;
 	return 0;
 }
 
 static void wl_free(struct wl_info *wl)
 {
-	if (wl->dev && wl->dev->reg_state == NETREG_REGISTERED)
-		unregister_netdev(wl->dev);
-	wl_cfg80211_detach(wl->cfg);
-	wl->cfg = NULL;
-	if (wl->dev)
-		wl->dev->ieee80211_ptr = NULL;
+	struct wl_if *ifp = wl->wlif;
+	struct net_device *dev = ifp ? ifp->dev : NULL;
+
+	if (dev && dev->reg_state == NETREG_REGISTERED) {
+		unregister_netdev(dev);		/* frees it (needs_free_netdev) */
+		dev = NULL;
+	}
+	if (ifp)
+		ifp->dev = NULL;
+	wl_cfg80211_detach(wl->cfg);	/* other net_devices, wiphy_unregister */
 	if (wl->irq_requested)
 		free_irq(wl->irq, wl);
 	tasklet_kill(&wl->tasklet);
 	if (wl->wlc)
 		wlc_detach(wl->wlc);
+	wl_cfg80211_free(wl->cfg);	/* after the core: it may still call wl_del_if() */
+	wl->cfg = NULL;
 	while (wl->timers)
 		wl_free_timer(wl, wl->timers);
 	if (wl->regsva)
 		iounmap(wl->regsva);
-	if (wl->dev)
-		free_netdev(wl->dev);
+	if (dev)
+		free_netdev(dev);	/* never registered */
+	kfree(ifp);
 	if (wl->osh)
 		osl_detach(wl->osh);
 	kfree(wl);
@@ -956,29 +1528,24 @@ static void *wl_attach(u16 vendor, u16 device, ulong regs, void *btparam, u32 ir
 	wl->osh = osl_attach(wl_glue_get_dmadev(core), SI_BUS, TRUE);
 	if (!wl->osh)
 		goto fail;
-
-	dev = alloc_etherdev(sizeof(struct wl_if));
-	if (!dev)
+	wlif = kzalloc(sizeof(*wlif), GFP_KERNEL);
+	if (!wlif)
 		goto fail;
-	wl->dev = dev;
-	wlif = netdev_priv(dev);
 	wlif->wl = wl;
-	wlif->dev = dev;
 	wl->wlif = wlif;
-#ifdef WL_CFG80211
-	strlcpy(dev->name, "wlan%d", IFNAMSIZ);	/* what OpenWrt's mac80211.sh expects */
-#else
-	strlcpy(dev->name, "wl%d", IFNAMSIZ);	/* what brcmwl.sh/wlc expect */
-#endif
-	dev->netdev_ops = &wl_netdev_ops;
-	dev->ethtool_ops = &wl_ethtool_ops;
-	dev->needed_headroom = WL_TXHEADROOM;
-	dev->base_addr = regs;
-	SET_NETDEV_DEV(dev, &core->dev);
 
 	wl->regsva = ioremap_nocache(regs, PCI_BAR0_WINSZ);
 	if (!wl->regsva)
 		goto fail;
+#ifdef WL_CFG80211
+	dev = wl_netdev_alloc(wlif, "wlan%d", NET_NAME_ENUM);	/* what OpenWrt's mac80211.sh expects */
+#else
+	dev = wl_netdev_alloc(wlif, "wl%d", NET_NAME_ENUM);	/* what brcmwl.sh/wlc expect */
+#endif
+	if (!dev)
+		goto fail;
+	dev->base_addr = regs;
+	wlif->dev = dev;
 
 	pr_info("wl%d: attaching Broadcom wl %s core 0x%x at 0x%lx irq %u\n",
 		unit, EPI_VERSION_STR, device, regs, irq);
@@ -998,7 +1565,6 @@ static void *wl_attach(u16 vendor, u16 device, ulong regs, void *btparam, u32 ir
 		goto fail;
 	}
 	wl->irq_requested = TRUE;
-	dev->irq = irq;
 
 	wl->cfg = wl_cfg80211_attach(wl, dev, &core->dev);
 	if (register_netdev(dev)) {
@@ -1022,17 +1588,11 @@ static void wl_remove(void *wldev)
 
 	if (!wl)
 		return;
-	if (wl->dev) {
-		rtnl_lock();		/* dev_close() needs RTNL */
-		if (netif_running(wl->dev))
-			dev_close(wl->dev);
-		rtnl_unlock();
-	}
 	WL_LOCK(wl);
 	if (wl->pub && PUB_UP(wl->pub))
 		wl_down(wl);
 	WL_UNLOCK(wl);
-	wl_free(wl);
+	wl_free(wl);		/* unregister_netdev() closes the interfaces */
 }
 
 static int __init wl_module_init(void)

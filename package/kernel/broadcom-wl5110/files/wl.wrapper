@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Andrew Druchenko
 # Stock Broadcom wl tool (ASUS RT-N12 D1 firmware, uClibc) with its private libraries.
 # LD_LIBRARY_PATH is scoped to this process only, so musl programs are unaffected.
 LD_LIBRARY_PATH=/usr/lib/brcm-wl exec /usr/lib/brcm-wl/wl "$@"

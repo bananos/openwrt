@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: ISC */
+/* Copyright (c) 2026 Andrew Druchenko */
 /*
  * Shadow of struct sk_buff as compiled into the closed wlc core: ASUS/Broadcom Linux 2.6.22.19,
  * MIPS o32 little endian, HNDCTF on, PKTC off.

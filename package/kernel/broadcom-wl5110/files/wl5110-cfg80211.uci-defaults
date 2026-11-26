@@ -1,19 +1,24 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Andrew Druchenko
 # First boot with the cfg80211 build of kmod-brcm-wl5110. The radio is then driven by the OpenWrt
 # "mac80211" wireless handler (netifd + hostapd/wpad) on the single interface wlan0:
 #  - an existing radio of type brcmwl (wlc/nas setup) becomes type mac80211; SSID, encryption and
 #    key are kept as they are
 #  - without any wireless config, a disabled AP without a key is written (as the wlc build does)
-#  - every wifi-iface of the radio gets ifname wlan0: the driver has one fixed netdev and cannot
-#    create others, while mac80211.sh would otherwise ask for wlan<phy number>
 #  - wl0 is dropped from the lan bridge list: netifd bridges wlan0 itself
+#  - the radio also gets its macaddr: on brcm47xx the bcma devices sit at the sysfs root
+#    (/sys/bcma0:1), so iwinfo (and with it the channel list in LuCI) cannot find the phy by
+#    path and falls back to the MAC address
 
 . /lib/functions.sh
 
 phy=$(ls /sys/class/ieee80211 2>/dev/null | head -n1)
+macaddr=
 if [ -n "$phy" ]; then
 	path=$(readlink -f /sys/class/ieee80211/$phy/device)
 	path=${path##/sys/devices/}		# as the detection in mac80211.sh computes it
+	macaddr=$(cat /sys/class/ieee80211/$phy/macaddress)
 else
 	path=/sys/bcma0:1
 fi
@@ -53,14 +58,8 @@ set wireless.$radio.path=$path
 set wireless.$radio.hwmode=11g
 set wireless.$radio.htmode=HT20
 UCI
+[ -n "$macaddr" ] && uci set wireless.$radio.macaddr=$macaddr
 
-set_ifname() {
-	local dev
-	config_get dev "$1" device
-	[ "$dev" = "$radio" ] && uci set wireless.$1.ifname=wlan0
-}
-config_load wireless
-config_foreach set_ifname wifi-iface
 uci commit wireless
 
 lan=

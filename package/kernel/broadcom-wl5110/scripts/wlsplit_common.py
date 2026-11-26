@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Andrew Druchenko
 """Shared definitions: where the closed wl_linux.c glue lives inside stock wl.ko 5.110.27.20012."""
 from elftools.elf.elffile import ELFFile
 from elftools.elf.relocation import RelocationSection

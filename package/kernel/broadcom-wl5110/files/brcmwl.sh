@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Andrew Druchenko
 # /lib/wifi/brcmwl.sh - legacy /sbin/wifi driver for the ported Broadcom wl 5.110.27 (ASUS RT-N12 D1).
 # Configures the radio with wlc (GPL, from OpenWrt broadcom-wl, extended for 5.110); the stock wl is not needed.
 # Driven by /etc/config/wireless; called by `wifi` and at boot by /etc/init.d/network (wifi reload_legacy).

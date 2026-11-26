@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Andrew Druchenko
 """Find a Broadcom TRX (HDR0) image in a file and write out its root filesystem partition.
 
 usage: trx_rootfs.py <image> <rootfs-out>

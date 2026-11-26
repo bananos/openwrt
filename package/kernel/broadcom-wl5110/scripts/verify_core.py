@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (c) 2026 Andrew Druchenko
 """Verify wlc_core.o: real (relocation-referenced) imports, unreferenced UND symbols, nothing points into glue."""
 import sys, collections
 sys.path.insert(0, __import__('os').path.dirname(__file__))

@@ -6,6 +6,11 @@
 # ISC (Broadcom shared code and headers), GPL-2.0 (wl_glue, scripts) or new code from this port.
 # Never distribute the resulting ipks or images: they contain the Broadcom core.
 #
+# Copyright (c) 2026 Andrew Druchenko
+#
+# This is free software, licensed under the GNU General Public License v2.
+# See /LICENSE for more information.
+#
 include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: ISC */
+/* Copyright (c) 2026 Andrew Druchenko */
 /*
  * Interface the closed wlc core (wlc_core.o, from stock wl.ko 5.110.27.20012) expects from the Linux glue.
  * Recovered 2026-11-25 from: OpenWrt broadcom-wl 5.10.56 wl_export.h + disassembly of the stock 5.110 glue
