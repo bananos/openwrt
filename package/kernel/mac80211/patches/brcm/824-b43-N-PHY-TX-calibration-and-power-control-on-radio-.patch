@@ -1,0 +1,319 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Druchenko <bananos@dev.co.ua>
+Date: Fri, 27 Nov 2026 20:54:02 +0200
+Subject: [PATCH] b43: N-PHY: TX calibration and power control on radio 2057
+ rev 13
+
+On N-PHY rev 17 with radio 2057 rev 13 (BCM5357/53572, ASUS RT-N12 D1),
+do what wl 5.110 does on that board (from its register writes):
+
+- Run the TX I/Q-LO calibration at PHY init, after a TX gain
+  pre-calibration (PAD 24/19/15/12/10 at a baseband multiplier of 0x40
+  per core, TSSI 20 over idle) that also sets the multiplier the
+  calibration ladders scale by; and again after a channel change (not
+  while scanning). The coefficients come out as wl's.
+- Idle TSSI: wl's RF sequencer table 8 values, the PA and T/R switch
+  overrides, and TSSI mux 0x11 only while measuring (0x01 in
+  operation); before, the measurement read the ADC minimum.
+- T/R switch override value 2 on core 1 in the calibration setup, the
+  LO feed-through table left at 0, and the TX power target capped at
+  wl's 0x36 (13.5 dBm) until the NVRAM per-rate powers are applied.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/wireless/broadcom/b43/phy_n.c | 203 +++++++++++++++++++++-
+ 1 file changed, 200 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/b43/phy_n.c b/drivers/net/wireless/broadcom/b43/phy_n.c
+index 154cab8..5351429 100644
+--- a/drivers/net/wireless/broadcom/b43/phy_n.c
++++ b/drivers/net/wireless/broadcom/b43/phy_n.c
+@@ -3983,6 +3983,11 @@ static void b43_nphy_tx_power_ctl_idle_tssi(struct b43_wldev *dev)
+ 
+ 	u32 tmp;
+ 	s32 rssi[4] = { };
++	static const u8 rfseq_off[4] = { 11, 27, 15, 31 };
++	u16 rfseq_save[4];
++	bool rev13 = phy->radio_ver == 0x2057 && phy->radio_rev == 13;
++	u16 reg2ff = 0;
++	int c;
+ 
+ 	if (phy->chandef->chan->flags & IEEE80211_CHAN_NO_IR)
+ 		return;
+@@ -3990,6 +3995,25 @@ static void b43_nphy_tx_power_ctl_idle_tssi(struct b43_wldev *dev)
+ 	if (b43_nphy_ipa(dev))
+ 		b43_nphy_ipa_internal_tssi_setup(dev);
+ 
++	/* Radio 2057 rev 13: wl 5.110 also sets RF sequencer table 8 and puts
++	 * the PA and TR switch under override before measuring. */
++	if (rev13) {
++		reg2ff = b43_phy_read(dev, 0x2ff);
++		for (c = 0; c < 4; c++)
++			rfseq_save[c] = b43_ntab_read(dev, B43_NTAB16(8, rfseq_off[c]));
++		b43_ntab_write(dev, B43_NTAB16(8, 11), 0x01a9);
++		b43_ntab_write(dev, B43_NTAB16(8, 27), 0x01a9);
++		b43_ntab_write(dev, B43_NTAB16(8, 15), 0x0002);
++		b43_ntab_write(dev, B43_NTAB16(8, 31), 0x0002);
++		b43_nphy_rf_ctl_intc_override(dev, N_INTC_OVERRIDE_OFF, 0, 3);
++		b43_nphy_rf_ctl_intc_override(dev, N_INTC_OVERRIDE_PA, 0, 3);
++		b43_nphy_rf_ctl_override_rev7(dev, 0x8, 0, 3, false, 0);
++		b43_nphy_rf_ctl_intc_override(dev, N_INTC_OVERRIDE_TRSW, 2, 3);
++		/* wl's TSSI mux for the measurement; 0x01 in operation */
++		b43_radio_write(dev, 0x17b, 0x11);
++		b43_radio_write(dev, 0x19b, 0x11);
++	}
++
+ 	if (phy->rev >= 19)
+ 		b43_nphy_rf_ctl_override_rev19(dev, 0x1000, 0, 3, false, 0);
+ 	else if (phy->rev >= 7)
+@@ -4012,6 +4036,16 @@ static void b43_nphy_tx_power_ctl_idle_tssi(struct b43_wldev *dev)
+ 	else if (phy->rev >= 3)
+ 		b43_nphy_rf_ctl_override(dev, 0x2000, 0, 3, true);
+ 
++	if (rev13) {
++		b43_nphy_rf_ctl_override_rev7(dev, 0x8, 0, 3, true, 0);
++		b43_nphy_rf_ctl_intc_override(dev, N_INTC_OVERRIDE_OFF, 0, 3);
++		b43_phy_write(dev, 0x2ff, reg2ff);
++		b43_radio_write(dev, 0x17b, 0x01);
++		b43_radio_write(dev, 0x19b, 0x01);
++		for (c = 0; c < 4; c++)
++			b43_ntab_write(dev, B43_NTAB16(8, rfseq_off[c]), rfseq_save[c]);
++	}
++
+ 	if (phy->rev >= 19) {
+ 		/* TODO */
+ 		return;
+@@ -4181,6 +4215,14 @@ static void b43_nphy_tx_power_ctl_setup(struct b43_wldev *dev)
+ 		target[0] = ppr_max;
+ 		target[1] = ppr_max;
+ 	}
++	/*
++	 * Radio 2057 rev 13: wl 5.110's target on the ASUS RT-N12 D1, 0x36
++	 * (13.5 dBm), where ppr_max gives 20 dBm. The per-rate powers of the
++	 * NVRAM (ofdm2gpo, mcs2gpo) are not applied yet; until they are, this
++	 * keeps the internal PA out of compression.
++	 */
++	if (phy->radio_ver == 0x2057 && phy->radio_rev == 13)
++		target[0] = target[1] = 0x36;
+ 
+ 	if (dev->phy.rev >= 3) {
+ 		if (sprom->fem.ghz2.tssipos)
+@@ -4723,6 +4765,10 @@ static void b43_nphy_tx_pwr_ctrl_coef_setup(struct b43_wldev *dev)
+ 
+ 	for (i = 0; i < 2; i++) {
+ 		tmp = buffer[5 + i];
++		/* wl 5.110 leaves the LO feed-through table at 0 on radio
++		 * 2057 rev 13 (its LO correction is elsewhere) */
++		if (dev->phy.radio_ver == 0x2057 && dev->phy.radio_rev == 13)
++			tmp = 0;
+ 		real_part = (tmp >> 8) & 0xFF;
+ 		imag_part = (tmp & 0xFF);
+ 		b43_phy_write(dev, B43_NPHY_TABLE_ADDR,
+@@ -5246,7 +5292,9 @@ static void b43_nphy_tx_cal_phy_setup(struct b43_wldev *dev)
+ 			b43_nphy_rf_ctl_intc_override(dev, N_INTC_OVERRIDE_PA,
+ 						      0, 3);
+ 		b43_nphy_rf_ctl_intc_override(dev, N_INTC_OVERRIDE_TRSW, 2, 1);
+-		b43_nphy_rf_ctl_intc_override(dev, N_INTC_OVERRIDE_TRSW, 8, 2);
++		/* radio 2057 rev 13: wl 5.110 sets 2 on core 1 too */
++		b43_nphy_rf_ctl_intc_override(dev, N_INTC_OVERRIDE_TRSW,
++			phy->radio_ver == 0x2057 && phy->radio_rev == 13 ? 2 : 8, 2);
+ 
+ 		regs[9] = b43_phy_read(dev, B43_NPHY_PAPD_EN0);
+ 		regs[10] = b43_phy_read(dev, B43_NPHY_PAPD_EN1);
+@@ -6125,6 +6173,121 @@ static void b43_nphy_superswitch_init(struct b43_wldev *dev, bool init)
+ 	}
+ }
+ 
++
++/*
++ * TX gain pre-calibration of radio 2057 rev 13 (BCM5357/53572, internal PA)
++ * at 2.4 GHz, as wl 5.110.27 runs it on the ASUS RT-N12 D1 before its TX
++ * I/Q-LO calibration (modelled on b43-next's rev 14 ePA one): after an idle
++ * TSSI read, each core plays a tone of amplitude 250 with only its baseband
++ * multiplier on and the TX gain forced to PAD 24, 19, 15, 12, 10 in turn,
++ * stopping once the TSSI over idle drops below the target, and keeps the
++ * closer of the last two. wl reached PAD 10 on both cores. Sets the
++ * multiplier the calibration ladders scale by and returns the gains.
++ */
++#define B43_NPHY_PRECAL13_GAIN(pad)	(0x7000 | ((pad) << 3) | 0x7)
++#define B43_NPHY_PRECAL13_TSSI		20
++#define B43_NPHY_PRECAL13_SAMPS		10
++static struct nphy_txgains b43_nphy_precal_txgain_2057_rev13(struct b43_wldev *dev)
++{
++	static const u8 pads[] = { 24, 19, 15, 12, 10 };
++	static const u8 tbl8_off[4] = { 0x0b, 0x0f, 0x1b, 0x1f };
++	struct b43_phy_n *nphy = dev->phy.n;
++	struct nphy_txgains target = b43_nphy_get_tx_gains(dev);
++	u32 freq = b43_is_40mhz(dev) ? 5000 : 2500;
++	const s32 aim = B43_NPHY_PRECAL13_TSSI * B43_NPHY_PRECAL13_SAMPS;
++	u16 m0m1 = 0x4040, tbl8[4], afe_over[2], rad[2][8], reg2ff;
++	s32 rssi[4], idle[2], delta[ARRAY_SIZE(pads)];
++	u8 core, i, n, pick[2];
++	u32 tmp;
++	int k;
++
++	reg2ff = b43_phy_read(dev, 0x2ff);
++	afe_over[0] = b43_phy_read(dev, B43_NPHY_AFECTL_OVER1);
++	afe_over[1] = b43_phy_read(dev, B43_NPHY_AFECTL_OVER);
++	b43_phy_set(dev, B43_NPHY_AFECTL_OVER1, 0x0100);
++	b43_phy_set(dev, B43_NPHY_AFECTL_OVER, 0x0100);
++	for (k = 0; k < 4; k++)
++		tbl8[k] = b43_ntab_read(dev, B43_NTAB16(8, tbl8_off[k]));
++	for (core = 0; core < 2; core++)
++		for (k = 0; k < 8; k++)
++			rad[core][k] = b43_radio_read(dev, (core ? 0x195 : 0x175) + k);
++
++	b43_nphy_ipa_internal_tssi_setup(dev);
++	b43_radio_write(dev, 0x17b, 0x11);
++	b43_radio_write(dev, 0x19b, 0x11);
++	b43_ntab_write(dev, B43_NTAB16(8, 0x0b), 0x01a9);
++	b43_ntab_write(dev, B43_NTAB16(8, 0x1b), 0x01a9);
++	b43_ntab_write(dev, B43_NTAB16(8, 0x0f), 0x0002);
++	b43_ntab_write(dev, B43_NTAB16(8, 0x1f), 0x0002);
++	b43_nphy_rf_ctl_intc_override(dev, N_INTC_OVERRIDE_OFF, 0, 3);
++	b43_nphy_rf_ctl_intc_override(dev, N_INTC_OVERRIDE_PA, 0, 3);
++	b43_nphy_rf_ctl_override_rev7(dev, 0x8, 0, 3, false, 0);
++	b43_nphy_rf_ctl_intc_override(dev, N_INTC_OVERRIDE_TRSW, 2, 3);
++
++	/* idle TSSI: no tone, no gain forced */
++	b43_nphy_rf_ctl_override_rev7(dev, 0x1000, 0, 3, false, 0);
++	b43_nphy_stop_playback(dev);
++	b43_nphy_tx_tone(dev, 4000, 0, false, false, false);
++	udelay(20);
++	tmp = b43_nphy_poll_rssi(dev, N_RSSI_TSSI_2G, rssi, 1);
++	b43_nphy_stop_playback(dev);
++	idle[0] = (s8)(tmp >> 24);
++	idle[1] = (s8)(tmp >> 8);
++
++	for (core = 0; core < 2; core++) {
++		for (n = 0; n < ARRAY_SIZE(pads); n++) {
++			u16 mult = core ? m0m1 & 0x00ff : m0m1 & 0xff00;
++
++			b43_nphy_tx_tone(dev, freq, 250, false, false, false);
++			b43_ntab_write(dev, B43_NTAB16(15, 87), mult);
++			b43_ntab_write(dev, B43_NTAB16(15, 95), mult);
++			b43_nphy_rf_ctl_override_rev7(dev, 0x1000,
++				B43_NPHY_PRECAL13_GAIN(pads[n]), 3, false, 0);
++			udelay(50);
++			b43_nphy_poll_rssi(dev, N_RSSI_TSSI_2G, rssi,
++					   B43_NPHY_PRECAL13_SAMPS);
++			nphy->bb_mult_save = 0;
++			b43_nphy_stop_playback(dev);
++			delta[n] = rssi[core ? 2 : 0] -
++				   B43_NPHY_PRECAL13_SAMPS * idle[core];
++			if (delta[n] < aim)
++				break;
++		}
++		if (n == ARRAY_SIZE(pads))
++			n--;
++		i = n;
++		if (n && abs(delta[n - 1] - aim) <= abs(delta[n] - aim))
++			i = n - 1;
++		pick[core] = pads[i];
++		b43dbg(dev->wl, "TX gain precal core %u: idle %d, PAD %u (delta %d at PAD %u, %d at PAD %u)\n",
++		       core, idle[core], pick[core], delta[0], pads[0], delta[n], pads[n]);
++	}
++
++	b43_nphy_rf_ctl_override_rev7(dev, 0x1000, 0, 3, true, 0);
++	b43_ntab_write(dev, B43_NTAB16(15, 87), m0m1);
++	b43_ntab_write(dev, B43_NTAB16(15, 95), m0m1);
++	b43_phy_write(dev, B43_NPHY_RFCTL_INTC1, 0);
++	b43_phy_write(dev, B43_NPHY_RFCTL_INTC2, 0);
++	b43_phy_write(dev, 0x2ff, reg2ff);
++	b43_nphy_rf_ctl_override_rev7(dev, 0x8, 0, 3, true, 0);
++	for (core = 0; core < 2; core++)
++		for (k = 0; k < 8; k++)
++			b43_radio_write(dev, (core ? 0x195 : 0x175) + k, rad[core][k]);
++	for (k = 0; k < 4; k++)
++		b43_ntab_write(dev, B43_NTAB16(8, tbl8_off[k]), tbl8[k]);
++	b43_phy_write(dev, B43_NPHY_AFECTL_OVER1, afe_over[0]);
++	b43_phy_write(dev, B43_NPHY_AFECTL_OVER, afe_over[1]);
++
++	nphy->txcal_bbmult = m0m1;
++	for (core = 0; core < 2; core++) {
++		target.txgm[core] = 7;
++		target.pga[core] = 0;
++		target.pad[core] = pick[core];
++		target.ipa[core] = 7;
++	}
++	return target;
++}
++
+ /* http://bcm-v4.sipsolutions.net/802.11/PHY/Init/N */
+ static int b43_phy_initn(struct b43_wldev *dev)
+ {
+@@ -6305,7 +6468,8 @@ static int b43_phy_initn(struct b43_wldev *dev)
+ 
+ 			if (nphy->antsel_type == 2)
+ 				b43_nphy_superswitch_init(dev, true);
+-			if (nphy->perical != 2) {
++			if (nphy->perical != 2 ||
++			    (phy->radio_ver == 0x2057 && phy->radio_rev == 13)) {
+ 				b43_nphy_rssi_cal(dev);
+ 				if (phy->rev >= 3) {
+ 					nphy->cal_orig_pwr_idx[0] =
+@@ -6314,6 +6478,8 @@ static int b43_phy_initn(struct b43_wldev *dev)
+ 					    nphy->txpwrindex[1].index_internal;
+ 					/* TODO N PHY Pre Calibrate TX Gain */
+ 					target = b43_nphy_get_tx_gains(dev);
++					if (phy->radio_ver == 0x2057 && phy->radio_rev == 13)
++						target = b43_nphy_precal_txgain_2057_rev13(dev);
+ 				}
+ 				if (!b43_nphy_cal_tx_iq_lo(dev, target, true, false))
+ 					if (b43_nphy_cal_rx_iq(dev, target, 2, 0) == 0)
+@@ -6776,12 +6942,40 @@ static void b43_nphy_op_switch_analog(struct b43_wldev *dev, bool on)
+ 	}
+ }
+ 
++/*
++ * Radio 2057 rev 13: calibrate TX again after a channel change, as wl does
++ * (its I/Q coefficients differ between channels 1 and 6). Not during scans.
++ */
++static void b43_nphy_rev13_recal(struct b43_wldev *dev)
++{
++	struct b43_phy *phy = &dev->phy;
++	struct b43_phy_n *nphy = phy->n;
++	struct nphy_txgains target;
++	bool pwrctl = nphy->txpwrctrl;
++	u16 c[4];
++
++	if (phy->radio_ver != 0x2057 || phy->radio_rev != 13 ||
++	    (dev->wl->hw->conf.flags & IEEE80211_CONF_OFFCHANNEL) ||
++	    nphy->txiqlocal_chanspec.center_freq == phy->chandef->chan->center_freq)
++		return;
++
++	b43_nphy_tx_power_ctrl(dev, false);
++	target = b43_nphy_precal_txgain_2057_rev13(dev);
++	b43_nphy_cal_tx_iq_lo(dev, target, true, false);
++	b43_nphy_tx_pwr_ctrl_coef_setup(dev);
++	b43_nphy_tx_power_ctrl(dev, pwrctl);
++	b43_ntab_read_bulk(dev, B43_NTAB16(15, 80), 4, c);
++	b43dbg(dev->wl, "TX recalibrated on %u MHz: %04x %04x %04x %04x\n",
++	       phy->chandef->chan->center_freq, c[0], c[1], c[2], c[3]);
++}
++
+ static int b43_nphy_op_switch_channel(struct b43_wldev *dev,
+ 				      unsigned int new_channel)
+ {
+ 	struct ieee80211_channel *channel = dev->wl->hw->conf.chandef.chan;
+ 	enum nl80211_channel_type channel_type =
+ 		cfg80211_get_chandef_type(&dev->wl->hw->conf.chandef);
++	int err;
+ 
+ 	if (b43_current_band(dev->wl) == NL80211_BAND_2GHZ) {
+ 		if ((new_channel < 1) || (new_channel > 14))
+@@ -6791,7 +6985,10 @@ static int b43_nphy_op_switch_channel(struct b43_wldev *dev,
+ 			return -EINVAL;
+ 	}
+ 
+-	return b43_nphy_set_channel(dev, channel, channel_type);
++	err = b43_nphy_set_channel(dev, channel, channel_type);
++	if (!err)
++		b43_nphy_rev13_recal(dev);
++	return err;
+ }
+ 
+ static unsigned int b43_nphy_op_get_default_chan(struct b43_wldev *dev)
+-- 
+2.53.0
+

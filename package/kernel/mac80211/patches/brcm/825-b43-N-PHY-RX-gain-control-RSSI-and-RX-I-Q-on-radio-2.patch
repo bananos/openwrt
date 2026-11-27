@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Druchenko <bananos@dev.co.ua>
+Date: Fri, 27 Nov 2026 20:54:02 +0200
+Subject: [PATCH] b43: N-PHY: RX gain control, RSSI and RX I/Q on radio 2057
+ rev 13
+
+b43's rev 7+ gain control setup is an empty TODO, and its rev 3+ RX I/Q
+calibration a stub. On radio 2057 rev 13 at 2.4 GHz, set up what wl
+5.110 does on the ASUS RT-N12 D1 (from its register writes): the LNA and
+gain tables, clip detection, the initial and clip gains, the clip
+thresholds and CRS minimum powers; and, until b43 calibrates them, wl's
+RSSI calibration results and RX I/Q compensation on that board.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/wireless/broadcom/b43/phy_n.c | 93 +++++++++++++++++++++++
+ 1 file changed, 93 insertions(+)
+
+diff --git a/drivers/net/wireless/broadcom/b43/phy_n.c b/drivers/net/wireless/broadcom/b43/phy_n.c
+index 5351429..b38cee1 100644
+--- a/drivers/net/wireless/broadcom/b43/phy_n.c
++++ b/drivers/net/wireless/broadcom/b43/phy_n.c
+@@ -2507,10 +2507,74 @@ static void b43_nphy_gain_ctl_workarounds_rev19(struct b43_wldev *dev)
+ 	/* TODO */
+ }
+ 
++/*
++ * Radio 2057 rev 13 (BCM5357/53572) at 2.4 GHz: the RX gain control setup of
++ * wl 5.110.27 on the ASUS RT-N12 D1, from its register writes (laid out as
++ * b43-next's rev 14 one): the LNA and gain tables, clip detection, initial and
++ * clip gains, the clip thresholds and the CRS minimum powers.
++ */
++static void b43_nphy_gain_ctl_workarounds_2057_rev13_2g(struct b43_wldev *dev)
++{
++	static const u8 trloss[2] = { 0x09, 0x09 };
++	static const u8 lna1_gain[4] = { 0x0a, 0x0f, 0x13, 0x19 };
++	static const u8 lna2_gain[4] = { 0xff, 0x08, 0x0c, 0x10 };
++	static const u8 gain_db[10] = { 0xfc, 0xff, 0x02, 0x05, 0x05,
++					0x05, 0x05, 0x05, 0x05, 0x05 };
++	static const u8 gain_bits[10] = { 0x00, 0x01, 0x02, 0x03, 0x03,
++					  0x03, 0x03, 0x03, 0x03, 0x03 };
++	static const u8 tbl4[4] = { 0x00, 0x00, 0x00, 0x7f };
++	static const u16 rfseq_init[2] = { 0x5136, 0x5136 };
++	unsigned int c;
++
++	for (c = 0; c < 2; c++) {
++		b43_ntab_write_bulk(dev, B43_NTAB8(c, 0), 2, trloss);
++		b43_ntab_write_bulk(dev, B43_NTAB8(c, 8), 4, lna1_gain);
++		b43_ntab_write_bulk(dev, B43_NTAB8(c, 16), 4, lna2_gain);
++		b43_ntab_write_bulk(dev, B43_NTAB8(c, 32), 10, gain_db);
++		b43_ntab_write_bulk(dev, B43_NTAB8(2 + c, 32), 10, gain_bits);
++	}
++	b43_ntab_write_bulk(dev, B43_NTAB8(4, 16), 4, tbl4);
++	b43_ntab_write_bulk(dev, B43_NTAB8(4, 80), 4, tbl4);
++
++	b43_phy_set(dev, B43_NPHY_C1_CGAINI, B43_NPHY_C1_CGAINI_CL2DETECT);
++	b43_phy_set(dev, B43_NPHY_C2_CGAINI, B43_NPHY_C2_CGAINI_CL2DETECT);
++
++	for (c = 0; c < 2; c++) {
++		u16 r = c ? 0x2a7 : 0x020;	/* REV3_Cx_INITGAIN_A */
++
++		b43_phy_write(dev, B43_PHY_N(r + 0), 0x006c);	/* INITGAIN_A */
++		b43_phy_write(dev, B43_PHY_N(r + 1), 0x0514);	/* INITGAIN_B */
++		b43_phy_write(dev, B43_PHY_N(r + 2), 0x002c);	/* CLIP_HIGAIN_A */
++		b43_phy_write(dev, B43_PHY_N(r + 3), 0x0224);	/* CLIP_HIGAIN_B */
++	}
++	b43_phy_write(dev, B43_PHY_N(0x037), 0x0024);	/* REV3_C1_CLIP_LOGAIN_A */
++	b43_phy_write(dev, B43_PHY_N(0x038), 0x0318);	/* REV3_C1_CLIP_LOGAIN_B */
++	b43_phy_write(dev, B43_PHY_N(0x2ad), 0x0024);	/* REV3_C2_CLIP_LOGAIN_A */
++	b43_phy_write(dev, B43_PHY_N(0x2ae), 0x0318);	/* REV3_C2_CLIP_LOGAIN_B */
++
++	b43_ntab_write_bulk(dev, B43_NTAB16(7, 0x106), 2, rfseq_init);
++
++	b43_phy_write(dev, B43_NPHY_C1_NBCLIPTHRES, 0x0012);
++	b43_phy_write(dev, B43_NPHY_C2_NBCLIPTHRES, 0x0012);
++	b43_phy_maskset(dev, B43_NPHY_CRSMINPOWERL0, 0xFF00, 0x0042);
++	b43_phy_maskset(dev, B43_NPHY_CRSMINPOWERU0, 0xFF00, 0x0042);
++	b43_phy_maskset(dev, B43_NPHY_BPHYCRSMINPOWER0, 0xFF00, 0x0046);
++	b43_phy_maskset(dev, B43_PHY_N(0x323), 0xFF00, 0x0040);
++	b43_phy_write(dev, B43_PHY_N(0x169), 0x1c02);
++	b43_phy_write(dev, B43_PHY_N(0x300), 0x0155);
++	b43_phy_write(dev, B43_PHY_N(0x301), 0x0155);
++}
++
+ static void b43_nphy_gain_ctl_workarounds_rev7(struct b43_wldev *dev)
+ {
+ 	struct b43_phy *phy = &dev->phy;
+ 
++	if (phy->radio_ver == 0x2057 && phy->radio_rev == 13 &&
++	    b43_current_band(dev->wl) == NL80211_BAND_2GHZ) {
++		b43_nphy_gain_ctl_workarounds_2057_rev13_2g(dev);
++		return;
++	}
++
+ 	switch (phy->rev) {
+ 	/* TODO */
+ 	}
+@@ -6493,6 +6557,35 @@ static int b43_phy_initn(struct b43_wldev *dev)
+ 
+ 	b43_nphy_tx_pwr_ctrl_coef_setup(dev);
+ 	b43_nphy_tx_power_ctrl(dev, tx_pwr_state);
++	if (phy->radio_ver == 0x2057 && phy->radio_rev == 13) {
++		/*
++		 * Radio 2057 rev 13: the RSSI calibration results of wl 5.110 on
++		 * the ASUS RT-N12 D1. b43's RSSI calibration leaves its defaults
++		 * on this radio; until it does more, use these.
++		 */
++		static const u16 rssi_regs[][2] = {
++			{ 0x19b, 0x004c }, { 0x19c, 0x0000 }, { 0x19d, 0x0000 },
++			{ 0x19e, 0x0026 }, { 0x19f, 0x0018 }, { 0x1a0, 0x0004 },
++			{ 0x1a1, 0x004c }, { 0x1a2, 0xffae }, { 0x1a3, 0x004c },
++			{ 0x1a4, 0x003e }, { 0x1a5, 0x003e }, { 0x1a6, 0x0000 },
++			{ 0x1aa, 0x003e }, { 0x1ab, 0x003e }, { 0x1ac, 0x0001 },
++			{ 0x1ae, 0x0000 }, { 0x1b0, 0x003e }, { 0x1b1, 0x003e },
++			{ 0x1b2, 0x0000 }, { 0x1b6, 0x003e }, { 0x1b7, 0x003e },
++			{ 0x1b8, 0x003f },
++		};
++		int k;
++
++		for (k = 0; k < ARRAY_SIZE(rssi_regs); k++)
++			b43_phy_write(dev, rssi_regs[k][0], rssi_regs[k][1]);
++	}
++	if (phy->radio_ver == 0x2057 && phy->radio_rev == 13) {
++		/* the RX I/Q compensation wl 5.110 calibrates on the RT-N12 D1:
++		 * b43's RX I/Q calibration for rev 3+ PHYs is a stub */
++		b43_phy_write(dev, B43_NPHY_C1_RXIQ_COMPA0, 0x007c);
++		b43_phy_write(dev, B43_NPHY_C1_RXIQ_COMPB0, 0x000d);
++		b43_phy_write(dev, B43_NPHY_C2_RXIQ_COMPA1, 0x03f8);
++		b43_phy_write(dev, B43_NPHY_C2_RXIQ_COMPB1, 0x000f);
++	}
+ 	b43_phy_write(dev, B43_NPHY_TXMACIF_HOLDOFF, 0x0015);
+ 	b43_phy_write(dev, B43_NPHY_TXMACDELAY, 0x0320);
+ 	if (phy->rev >= 3 && phy->rev <= 6)
+-- 
+2.53.0
+
