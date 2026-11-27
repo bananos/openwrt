@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Druchenko <bananos@dev.co.ua>
+Date: Fri, 27 Nov 2026 22:43:45 +0200
+Subject: [PATCH] b43: N-PHY: per-rate TX power on radio 2057 rev 13
+
+The adjusted power table (tables 26/27, offset 64) holds each rate's
+power below the TX power control target, as brcmsmac fills it from
+tx_power_offset[]; b43 never filled tx_power_offset[], so every rate
+went at the target. On radio 2057 rev 13, fill it from b43's PPR (the
+SROM's cck2gpo, ofdm2gpo, mcs2gpo, CDD and STBC offsets, capped by the
+regulatory limit and the user's TX power), whose rates are in the order
+of its first 52 entries. Drop the fixed 13.5 dBm target of that radio:
+the target is the PPR maximum again.
+
+On an ASUS RT-N12 D1 (channel 11, HT20, ht=1): TX retries 12% (was
+27%), 12.1 / 19.6 Mbit/s AP->client / client->AP at 20 dBm, 12.1 / 22.7
+with the TX power set to 14 dBm.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/wireless/broadcom/b43/phy_n.c | 24 +++++++++++++++--------
+ 1 file changed, 16 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/b43/phy_n.c b/drivers/net/wireless/broadcom/b43/phy_n.c
+index e824089..66cacc1 100644
+--- a/drivers/net/wireless/broadcom/b43/phy_n.c
++++ b/drivers/net/wireless/broadcom/b43/phy_n.c
+@@ -4278,15 +4278,23 @@ static void b43_nphy_tx_power_ctl_setup(struct b43_wldev *dev)
+ 	if (ppr_max) {
+ 		target[0] = ppr_max;
+ 		target[1] = ppr_max;
++
++		/*
++		 * The per-rate powers relative to the target, for the adjusted
++		 * power table (as brcmsmac's tx_power_offset[]): b43's PPR
++		 * rates are in the order of its first 52 entries (CCK, OFDM,
++		 * OFDM CDD, MCS 20 MHz SISO, CDD, STBC, SDM). 40 MHz: none yet.
++		 * So far only on radio 2057 rev 13, where it was tested.
++		 */
++		memset(nphy->tx_power_offset, 0, sizeof(nphy->tx_power_offset));
++		for (i = 0; phy->radio_ver == 0x2057 && phy->radio_rev == 13 &&
++			    i < B43_PPR_RATES_NUM &&
++			    i < ARRAY_SIZE(nphy->tx_power_offset); i++) {
++			u8 r = nphy->tx_pwr_max_ppr.__all_rates[i];
++
++			nphy->tx_power_offset[i] = r && r < ppr_max ? ppr_max - r : 0;
++		}
+ 	}
+-	/*
+-	 * Radio 2057 rev 13: wl 5.110's target on the ASUS RT-N12 D1, 0x36
+-	 * (13.5 dBm), where ppr_max gives 20 dBm. The per-rate powers of the
+-	 * NVRAM (ofdm2gpo, mcs2gpo) are not applied yet; until they are, this
+-	 * keeps the internal PA out of compression.
+-	 */
+-	if (phy->radio_ver == 0x2057 && phy->radio_rev == 13)
+-		target[0] = target[1] = 0x36;
+ 
+ 	if (dev->phy.rev >= 3) {
+ 		if (sprom->fem.ghz2.tssipos)
+-- 
+2.53.0
+
