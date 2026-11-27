@@ -533,6 +533,57 @@ static int wl_cfg_beacon_rates(const struct cfg80211_beacon_data *b, u8 *rates, 
 	return n;
 }
 
+/*
+ * The core builds the WPA/RSN elements of its beacons and probe responses itself, from wsec and
+ * wpa_auth; hostapd puts its own into message 3 of the 4-way handshake, and clients compare the two
+ * byte for byte (IE_DIFFERENT otherwise). They agree for WPA2 with PSK or 802.1X, with any cipher.
+ * They cannot agree for:
+ *  - WPA (v1): the core always adds RSN-style capabilities (0x000c, from WMM) to its WPA element,
+ *    hostapd never does; wpa_cap cannot change it, wpaie is STA-only;
+ *  - 802.11w (MFP capable, SHA256 AKMs) and 802.11r (FT AKMs, MDIE): not in this core;
+ *  - WMM off: hostapd then says 1 PTKSA replay counter, the core (always WMM) 16.
+ * WPA/WPA2 mixed works as WPA2: with no WPA element in the beacon, clients skip comparing hostapd's.
+ * hostapd 2.9 hands over only the PSK/802.1X AKMs, so the others are read from its RSN element.
+ */
+static void wl_cfg_check_rsn(struct net_device *dev, const struct cfg80211_beacon_data *b, u32 *auth)
+{
+	const u8 *ie = b->tail, *end = b->tail + b->tail_len;
+	const u32 wpa1 = WL_CFG_AUTH_WPA_PSK | WL_CFG_AUTH_WPA_8021X;
+	const u32 wpa2 = WL_CFG_AUTH_WPA2_PSK | WL_CFG_AUTH_WPA2_8021X;
+	int n, i;
+
+	if ((*auth & wpa1) && (*auth & wpa2)) {
+		*auth &= ~wpa1;
+		netdev_info(dev, "WPA/WPA2 mixed mode runs as WPA2 (this core's WPA element cannot match hostapd's)\n");
+	} else if (*auth & wpa1) {
+		netdev_warn(dev, "WPA (v1) is not supported by this core: clients will fail the 4-way handshake; use WPA2 or WPA/WPA2 mixed\n");
+	}
+	for (; ie && ie + 2 <= end && ie + 2 + ie[1] <= end; ie += 2 + ie[1]) {
+		const u8 *p = ie + 2, *e = ie + 2 + ie[1];
+
+		if (ie[0] != WLAN_EID_RSN)
+			continue;
+		p += 2 + 4;				/* version, group cipher */
+		if (p + 2 > e)
+			return;
+		n = p[0] | p[1] << 8;			/* pairwise ciphers */
+		p += 2 + 4 * n;
+		if (p + 2 > e)
+			return;
+		n = p[0] | p[1] << 8;			/* AKM suites */
+		for (i = 0, p += 2; i < n && p + 4 <= e; i++, p += 4)
+			if (p[0] == 0x00 && p[1] == 0x0f && p[2] == 0xac && p[3] != 1 && p[3] != 2)
+				netdev_warn(dev, "AKM 00-0f-ac:%d (802.11r FT, 802.11w SHA256 or SAE) is not supported by this core: clients will fail the 4-way handshake\n",
+					    p[3]);
+		if (p + 2 <= e && (p[0] & 0x80))	/* RSN capabilities: MFP capable */
+			netdev_warn(dev, "802.11w (management frame protection) is not supported by this core: clients will fail the 4-way handshake\n");
+		/* PTKSA replay counters: 16 with WMM; the core always runs WMM and says 16 */
+		if (p + 2 <= e && (p[0] & 0x0c) != 0x0c)
+			netdev_warn(dev, "WMM off is not supported by this core (it always runs WMM): clients will fail the 4-way handshake\n");
+		return;
+	}
+}
+
 static int wl_cfg_start_ap_op(struct wiphy *wiphy, struct net_device *dev,
 			      struct cfg80211_ap_settings *s)
 {
@@ -558,6 +609,7 @@ static int wl_cfg_start_ap_op(struct wiphy *wiphy, struct net_device *dev,
 	err = wl_cfg_crypto(&s->crypto, s->privacy, &ap.wsec, &ap.auth);
 	if (err)
 		return err;
+	wl_cfg_check_rsn(dev, &s->beacon, &ap.auth);
 	/* the radio's channel: a connected STA decides it, else the first AP to start */
 	sta = wl_cfg_vif_of_type(vif->cfg, NL80211_IFTYPE_STATION);
 	ap.set_radio = !(sta && (sta->connected || sta->connecting)) && !wl_cfg_ap_running(vif->cfg);
