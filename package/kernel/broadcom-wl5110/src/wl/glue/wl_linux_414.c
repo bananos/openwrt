@@ -1847,18 +1847,33 @@ static void wl_remove(void *wldev)
 	wl_free(wl);		/* unregister_netdev() closes the interfaces */
 }
 
+#ifdef WL_CAPTURE
+int wl_capture_init(void);
+void wl_capture_exit(void);
+#endif
+
 static int __init wl_module_init(void)
 {
 	int err = osl_module_init();
 
 	if (err)
 		return err;
+#ifdef WL_CAPTURE
+	err = wl_capture_init();
+	if (err) {
+		osl_module_exit();
+		return err;
+	}
+#endif
 	wl_glue_set_attach_callback(&wl_attach);
 	wl_glue_set_remove_callback(&wl_remove);
 	err = wl_glue_register();
 	if (err) {
 		wl_glue_set_attach_callback(NULL);
 		wl_glue_set_remove_callback(NULL);
+#ifdef WL_CAPTURE
+		wl_capture_exit();
+#endif
 		osl_module_exit();
 	}
 	return err;
@@ -1870,6 +1885,9 @@ static void __exit wl_module_exit(void)
 	wl_glue_set_attach_callback(NULL);
 	wl_glue_set_remove_callback(NULL);
 	nvram_release();
+#ifdef WL_CAPTURE
+	wl_capture_exit();
+#endif
 	osl_module_exit();
 }
 

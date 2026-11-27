@@ -17,3 +17,10 @@ ifeq ($(WL_CFG80211),y)
 wl-objs += glue/wl_cfg80211.o
 ccflags-y += -DWL_CFG80211
 endif
+
+# optional register capture (never shipped): the package runs scripts/wl_hook.py on the core and
+# passes WL_CAPTURE=y
+ifeq ($(WL_CAPTURE),y)
+wl-objs += glue/wl_capture.o
+ccflags-y += -DWL_CAPTURE
+endif

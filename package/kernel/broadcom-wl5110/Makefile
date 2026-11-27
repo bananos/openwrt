@@ -19,7 +19,7 @@ PKG_VERSION:=5.110.27.20012
 PKG_RELEASE:=1
 PKG_LICENSE:=Proprietary (core, extracted at build time) ISC GPL-2.0
 PKG_MAINTAINER:=
-PKG_CONFIG_DEPENDS:=CONFIG_BRCMWL5110_CFG80211
+PKG_CONFIG_DEPENDS:=CONFIG_BRCMWL5110_CFG80211 CONFIG_BRCMWL5110_CAPTURE
 
 BRCMWL5110_FW:=$(call qstrip,$(CONFIG_BRCMWL5110_FIRMWARE))
 ifeq ($(BRCMWL5110_FW),)
@@ -90,6 +90,14 @@ define KernelPackage/brcm-wl5110/config
 		  wifi-device on interface wlan0, run by netifd and OpenWrt's own
 		  hostapd (wpad), and shown in LuCI. The brcmwl5110 package (wlc,
 		  nas) is then not needed. Pulls in kmod-cfg80211 and iw.
+
+	config BRCMWL5110_CAPTURE
+		bool "Register capture for open-driver work (developers only)"
+		default n
+		help
+		  Logs the core's PHY, radio and PHY table writes to /proc/wlcap,
+		  as a reference for adding this radio to b43. Costs 2 MB of RAM
+		  and slows the radio down. Never use it in normal images.
   endif
 endef
 
@@ -140,7 +148,14 @@ define Build/Prepare
 		$(PKG_BUILD_DIR)/sasquatch-$(SASQUATCH_VER)/squashfs-tools/sasquatch \
 		$(TARGET_CROSS)objcopy
 	$(CP) $(PKG_BUILD_DIR)/blob/wlc_core.o_shipped $(PKG_BUILD_DIR)/wl/
+	$(if $(CONFIG_BRCMWL5110_CAPTURE), \
+		python3 ./scripts/wl_hook.py $(PKG_BUILD_DIR)/blob/wlc_core.o_shipped \
+			$(PKG_BUILD_DIR)/wl/wlc_core.o_shipped $(WL_CAPTURE_HOOKS))
 endef
+
+# PHY, radio and PHY table writers of the core, logged by glue/wl_capture.c
+WL_CAPTURE_HOOKS:=write_radio_reg mod_radio_reg and_radio_reg or_radio_reg xor_radio_reg \
+	phy_reg_write phy_reg_mod phy_reg_and phy_reg_or wlc_phy_write_table
 
 ifdef CONFIG_BRCMWL5110_CFG80211
   # build against OpenWrt's cfg80211 (mac80211 backports), not the kernel's own headers
@@ -158,7 +173,8 @@ endif
 
 define Build/Compile
 	+$(KERNEL_MAKE) M=$(PKG_BUILD_DIR)/wl_glue modules
-	+$(KERNEL_MAKE) M=$(PKG_BUILD_DIR)/wl $(WL_CFG80211_MAKE) modules
+	+$(KERNEL_MAKE) M=$(PKG_BUILD_DIR)/wl $(WL_CFG80211_MAKE) \
+		$(if $(CONFIG_BRCMWL5110_CAPTURE),WL_CAPTURE=y) modules
 	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) -Wno-pointer-sign \
 		-I$(PKG_BUILD_DIR)/wlc -I$(PKG_BUILD_DIR)/wl/include \
 		-o $(PKG_BUILD_DIR)/wlc/wlc $(PKG_BUILD_DIR)/wlc/wlc.c $(PKG_BUILD_DIR)/wlc/wlutils.c
