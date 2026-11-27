@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Druchenko <bananos@dev.co.ua>
+Date: Fri, 27 Nov 2026 12:25:56 +0200
+Subject: [PATCH] b43: accept radio 2057 rev 13 on N-PHY (experimental)
+
+The BCM5357/53572 SoCs (e.g. ASUS RT-N12 D1) have an N-PHY rev 17 with
+radio 2057 rev 13. b43 rejects that radio at probe. Accept it with a
+warning, so the probe, board data, firmware and PHY init can be tested;
+the radio still has no init or channel tables.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/wireless/broadcom/b43/main.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/broadcom/b43/main.c
+index 7d73480..7d28a5c 100644
+--- a/drivers/net/wireless/broadcom/b43/main.c
++++ b/drivers/net/wireless/broadcom/b43/main.c
+@@ -4636,8 +4636,11 @@ static int b43_phy_versioning(struct b43_wldev *dev)
+ 		    radio_id != 0x2057)
+ 			unsupported = 1;
+ 		if (radio_id == 0x2057 &&
+-		    !(radio_rev == 9 || radio_rev == 14))
++		    !(radio_rev == 9 || radio_rev == 13 || radio_rev == 14))
+ 			unsupported = 1;
++		if (radio_id == 0x2057 && radio_rev == 13)
++			b43warn(dev->wl, "Radio 2057 rev 13 (BCM5357/53572) has no "
++				"init or channel tables yet: experimental\n");
+ 		break;
+ 	case B43_PHYTYPE_LP:
+ 		if (radio_id != 0x2062 && radio_id != 0x2063)
+-- 
+2.53.0
+
