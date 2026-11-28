@@ -1,0 +1,1489 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Druchenko <bananos@dev.co.ua>
+Date: Sat, 28 Nov 2026 10:53:20 +0200
+Subject: [PATCH] b43: N-PHY: TX A-MPDU on 802.11n cores
+
+Take TX block ack sessions and send A-MPDUs on N-PHY cores with the
+802.11n microcode. b43 builds them in its TX work from consecutive
+frames of one station and TID inside the session's window, within the
+station's length and density limits, and posts the members to the DMA
+ring together, marked first, intermediate and last in their TX headers.
+The microcode reports one TX status for an A-MPDU followed by the block
+ack bitmap; the members not acknowledged go back to the head of the
+queue a few times (at the fallback rate after two), then to mac80211,
+which sends a BAR past them. One rate control sample per A-MPDU goes to
+minstrel_ht. mac80211 of 4.19 has no TX queue scheduling, so b43 bounds
+its own queues and stops mac80211's.
+
+The 802.11n initvals leave the BE TX FIFO too small for an A-MPDU and
+the PHY reports TX errors; size the FIFOs as brcmsmac does for core
+rev 28.
+
+A flow of TCP ACKs gains nothing from aggregation and the station's
+reorder buffer holds them behind any hole, which costs an upload a
+quarter of its rate; no TX session is taken for such a flow, and one
+that turns short is ended.
+
+ampdu_tx=0 turns TX A-MPDU off.
+
+On an ASUS RT-N12 D1 (channel 11, HT20, ht=1): AP->client 12.0 Mbit/s
+(10.9 with ampdu_tx=0), client->AP 21.9 (23.0).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/wireless/broadcom/b43/Makefile |   1 +
+ drivers/net/wireless/broadcom/b43/ampdu.c  | 450 +++++++++++++++++++++
+ drivers/net/wireless/broadcom/b43/ampdu.h  |  48 +++
+ drivers/net/wireless/broadcom/b43/b43.h    |   9 +
+ drivers/net/wireless/broadcom/b43/dma.c    | 180 ++++++++-
+ drivers/net/wireless/broadcom/b43/dma.h    |  18 +
+ drivers/net/wireless/broadcom/b43/main.c   | 222 ++++++++--
+ drivers/net/wireless/broadcom/b43/pio.c    |   2 +-
+ drivers/net/wireless/broadcom/b43/xmit.c   | 117 +++++-
+ drivers/net/wireless/broadcom/b43/xmit.h   |  23 +-
+ 10 files changed, 1000 insertions(+), 70 deletions(-)
+ create mode 100644 drivers/net/wireless/broadcom/b43/ampdu.c
+ create mode 100644 drivers/net/wireless/broadcom/b43/ampdu.h
+
+diff --git a/drivers/net/wireless/broadcom/b43/Makefile b/drivers/net/wireless/broadcom/b43/Makefile
+index 48589b5..01a2e3c 100644
+--- a/drivers/net/wireless/broadcom/b43/Makefile
++++ b/drivers/net/wireless/broadcom/b43/Makefile
+@@ -18,6 +18,7 @@ b43-$(CPTCFG_B43_PHY_AC)	+= phy_ac.o
+ b43-y				+= sysfs.o
+ b43-y				+= xmit.o
+ b43-y				+= dma.o
++b43-y				+= ampdu.o
+ b43-$(CPTCFG_B43_PIO)		+= pio.o
+ b43-y				+= rfkill.o
+ b43-y				+= ppr.o
+diff --git a/drivers/net/wireless/broadcom/b43/ampdu.c b/drivers/net/wireless/broadcom/b43/ampdu.c
+new file mode 100644
+index 0000000..399c4bc
+--- /dev/null
++++ b/drivers/net/wireless/broadcom/b43/ampdu.c
+@@ -0,0 +1,450 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Block ack sessions and the TX A-MPDUs b43 builds on 802.11n N-PHY cores.
++ *
++ * The microcode sends an A-MPDU whose members are posted to the DMA ring
++ * together (first, intermediate, last in their TX headers) and reports one
++ * TX status for it, followed by the block ack bitmap when one came. b43
++ * builds the A-MPDUs from its own TX queues: consecutive frames of one
++ * station and TID, inside the session's window. The members not
++ * acknowledged are sent again, a few times, ahead of the queue.
++ *
++ * The design follows b43-next's ampdu.c, without the TX queue scheduling
++ * mac80211 of 4.19 does not have.
++ */
++#include <linux/module.h>
++#include "b43.h"
++#include "ampdu.h"
++#include "dma.h"
++#include "main.h"
++#include "xmit.h"
++
++/* Driver retransmissions of a member not acknowledged; after
++ * B43_AMPDU_TX_RR_LIMIT of them its A-MPDU goes at the fallback rate. */
++static int modparam_ampdu_tx = 1;
++module_param_named(ampdu_tx, modparam_ampdu_tx, int, 0444);
++MODULE_PARM_DESC(ampdu_tx, "Send A-MPDUs on 802.11n (1, default) or not (0)");
++
++/* A data frame this long or longer carries bulk payload */
++#define B43_AMPDU_BULK_LEN		500
++/* Frames counted before the estimate is halved */
++#define B43_AMPDU_CLASSIFY_SPAN		256
++
++#define B43_AMPDU_TX_RETRY_LIMIT	6
++#define B43_AMPDU_TX_RR_LIMIT		2
++
++static u16 b43_ampdu_seq(const struct sk_buff *skb)
++{
++	const struct ieee80211_hdr *hdr = (const void *)skb->data;
++
++	return IEEE80211_SEQ_TO_SN(le16_to_cpu(hdr->seq_ctrl));
++}
++
++/* Whether a frame may be an A-MPDU member */
++static bool b43_ampdu_member(struct sk_buff *skb)
++{
++	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
++	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
++
++	return (info->flags & IEEE80211_TX_CTL_AMPDU) &&
++	       !(info->flags & (IEEE80211_TX_CTL_NO_ACK |
++				IEEE80211_TX_CTL_SEND_AFTER_DTIM)) &&
++	       ieee80211_is_data_qos(hdr->frame_control) &&
++	       !ieee80211_has_morefrags(hdr->frame_control) &&
++	       ieee80211_get_tid(hdr) < B43_AMPDU_TIDS;
++}
++
++static bool b43_ampdu_same_flow(struct sk_buff *a, struct sk_buff *b)
++{
++	struct ieee80211_hdr *ha = (struct ieee80211_hdr *)a->data;
++	struct ieee80211_hdr *hb = (struct ieee80211_hdr *)b->data;
++
++	return ether_addr_equal(ha->addr1, hb->addr1) &&
++	       ieee80211_get_tid(ha) == ieee80211_get_tid(hb);
++}
++
++/* The TX state of a frame's station and TID, or NULL. Under rcu_read_lock. */
++static struct b43_ampdu_tx_tid *b43_ampdu_tid(struct b43_wl *wl,
++					      struct sk_buff *skb,
++					      struct ieee80211_sta **sta_out)
++{
++	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
++	struct ieee80211_sta *sta;
++
++	sta = ieee80211_find_sta_by_ifaddr(wl->hw, hdr->addr1, hdr->addr2);
++	if (sta_out)
++		*sta_out = sta;
++	if (!sta)
++		return NULL;
++	return &((struct b43_sta *)sta->drv_priv)->tid[ieee80211_get_tid(hdr) %
++						      B43_AMPDU_TIDS];
++}
++
++/* Null delimiters after an MPDU so that the next one starts at least
++ * spacing bytes after this one's start; at most 63. */
++static u8 b43_ampdu_ndelim(unsigned int mpdu, unsigned int spacing)
++{
++	unsigned int start = 4 + ALIGN(mpdu, 4);
++
++	return spacing > start ? min(DIV_ROUND_UP(spacing - start, 4), 63U) : 0;
++}
++
++/* Whether the flow is mostly short frames: aggregating TCP ACKs gains
++ * nothing and the station's reorder buffer delays them behind any hole,
++ * which costs more than half of an upload's rate. */
++static bool b43_ampdu_flow_brief(const struct b43_ampdu_tx_tid *t)
++{
++	return t->brief + t->bulk >= B43_AMPDU_CLASSIFY_SPAN / 4 &&
++	       t->bulk * 8 < t->brief;
++}
++
++/*
++ * Count a frame queued for @sta into its TID's estimate, and end the TX
++ * block ack session of a flow that went short. From b43_op_tx().
++ */
++void b43_ampdu_classify(struct ieee80211_sta *sta, struct sk_buff *skb)
++{
++	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
++	struct b43_ampdu_tx_tid *t;
++	u8 tid;
++
++	if (!sta || !ieee80211_is_data_qos(hdr->frame_control))
++		return;
++	tid = ieee80211_get_tid(hdr);
++	if (tid >= B43_AMPDU_TIDS)
++		return;
++	t = &((struct b43_sta *)sta->drv_priv)->tid[tid];
++	if (skb->len >= B43_AMPDU_BULK_LEN)
++		t->bulk++;
++	else
++		t->brief++;
++	if (t->bulk + t->brief >= B43_AMPDU_CLASSIFY_SPAN) {
++		t->bulk /= 2;
++		t->brief /= 2;
++	}
++	if (READ_ONCE(t->buf_size) && !t->stopping &&
++	    b43_ampdu_flow_brief(t)) {
++		t->stopping = true;
++		ieee80211_stop_tx_ba_session(sta, tid);
++	}
++}
++
++/*
++ * Send the frames at the head of @q as one A-MPDU. Returns 1 if they went
++ * out (or were dropped), 0 if the first frame is not for an A-MPDU (the
++ * caller sends it alone), -ENOSPC if the ring takes no A-MPDU now (the
++ * frames stay queued). Called from b43_tx_work() under wl->mutex.
++ */
++int b43_ampdu_tx(struct b43_wldev *dev, struct sk_buff_head *q,
++		 u8 queue_prio)
++{
++	struct b43_wl *wl = dev->wl;
++	struct sk_buff *skbs[B43_AMPDU_TX_MAX_MPDUS];
++	struct b43_txhdr_ampdu ampdu[B43_AMPDU_TX_MAX_MPDUS];
++	struct ieee80211_tx_info *first;
++	struct ieee80211_tx_rate *rates;
++	struct ieee80211_sta *sta;
++	struct b43_ampdu_tx_tid *t;
++	struct sk_buff *skb, *pos;
++	unsigned int n = 0, len = 0, pad = 0, max_n, max_len, spacing, i;
++	unsigned long flags;
++	u16 start;
++	u8 mcs;
++	int err;
++
++	skb = skb_peek(q);
++	if (!skb || !dev->phy.nphy_ht || b43_using_pio_transfers(dev) ||
++	    !b43_ampdu_member(skb))
++		return 0;
++	first = IEEE80211_SKB_CB(skb);
++	rates = first->control.rates;
++
++	rcu_read_lock();
++	t = b43_ampdu_tid(wl, skb, &sta);
++	if (!t || !t->buf_size) {
++		rcu_read_unlock();
++		return 0;
++	}
++	/* After a few failed tries the member's A-MPDU uses the fallback */
++	if (t->retries[b43_ampdu_seq(skb) % B43_AMPDU_TX_WINDOW] >
++	    B43_AMPDU_TX_RR_LIMIT && rates[1].idx >= 0 &&
++	    (rates[1].flags & IEEE80211_TX_RC_MCS))
++		rates[0] = rates[1];
++	if (!(rates[0].flags & IEEE80211_TX_RC_MCS) || rates[0].idx < 0 ||
++	    rates[0].idx > 15) {
++		rcu_read_unlock();
++		return 0;
++	}
++	mcs = rates[0].idx;
++	max_n = min_t(unsigned int, b43_dma_tx_ampdu_room(dev, queue_prio),
++		      B43_AMPDU_TX_MAX_MPDUS);
++	if (!max_n) {
++		rcu_read_unlock();
++		return -ENOSPC;
++	}
++	/* A rate control probe goes alone, as an ordinary MPDU */
++	if (first->flags & IEEE80211_TX_CTL_RATE_CTRL_PROBE) {
++		rcu_read_unlock();
++		return 0;
++	}
++	max_len = (1 << (IEEE80211_HT_MAX_AMPDU_FACTOR +
++			 sta->ht_cap.ampdu_factor)) - 1;
++	spacing = b43_ampdu_tx_spacing(mcs, sta->ht_cap.ampdu_density);
++	start = b43_ampdu_seq(skb);
++
++	spin_lock_irqsave(&q->lock, flags);
++	skb_queue_walk(q, pos) {
++		struct ieee80211_tx_info *info = IEEE80211_SKB_CB(pos);
++		unsigned int mpdu, next_len;
++
++		if (n == max_n)
++			break;
++		if (n && (!b43_ampdu_member(pos) ||
++			  (info->flags & IEEE80211_TX_CTL_RATE_CTRL_PROBE) ||
++			  !b43_ampdu_same_flow(skb, pos)))
++			break;
++		/* Inside the peer's window from the first member */
++		if (ieee80211_sn_sub(b43_ampdu_seq(pos), start) >= t->buf_size)
++			break;
++		/* Each MPDU follows a 4-byte delimiter and pads to 4 bytes */
++		mpdu = b43_tx_psdu_len(pos);
++		next_len = n ? len + pad + 4 + mpdu : 4 + mpdu;
++		if (n && (next_len > max_len || !b43_ampdu_tx_fits(mcs, next_len)))
++			break;
++		ampdu[n].ndelim = b43_ampdu_ndelim(mpdu, spacing);
++		pad = ALIGN(mpdu, 4) - mpdu + 4 * ampdu[n].ndelim;
++		len = next_len;
++		skbs[n++] = pos;
++	}
++	/*
++	 * A frame alone goes as an ordinary MPDU: the peer may answer an
++	 * A-MPDU of one MPDU with an ACK, which the microcode does not take
++	 * for its block ack (a third of them failed on a TCP ACK stream). It
++	 * waits while the ring is busy (b43_dma_tx_busy()), so that the frames
++	 * after it gather into an A-MPDU.
++	 */
++	if (n < 2) {
++		spin_unlock_irqrestore(&q->lock, flags);
++		rcu_read_unlock();
++		if (b43_dma_tx_busy(dev, queue_prio))
++			return -ENOSPC;
++		t->retries[start % B43_AMPDU_TX_WINDOW] = 0;
++		return 0;
++	}
++	for (i = 0; i < n; i++)
++		__skb_unlink(skbs[i], q);
++	spin_unlock_irqrestore(&q->lock, flags);
++	rcu_read_unlock();
++
++	/* Every member goes at the first member's rates */
++	for (i = 0; i < n; i++) {
++		struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skbs[i]);
++
++		if (i)
++			memcpy(info->control.rates, first->control.rates,
++			       sizeof(info->control.rates));
++		/* b43's bounce buffer pointer overwrote it on a retry */
++		info->control.vif = wl->vif;
++		ampdu[i].first = !i;
++		ampdu[i].last = i == n - 1;
++		ampdu[i].len = len;
++	}
++	ampdu[n - 1].ndelim = 0;
++
++	err = b43_dma_tx_ampdu(dev, queue_prio, skbs, ampdu, n);
++	if (err == -ENOSPC) {
++		for (i = n; i-- > 0;)
++			skb_queue_head(q, skbs[i]);
++		return -ENOSPC;
++	}
++	if (unlikely(err)) {
++		/* No key any more, or no DMA mapping: drop them */
++		for (i = 0; i < n; i++)
++			ieee80211_free_txskb(wl->hw, skbs[i]);
++	}
++	return 1;
++}
++
++/* Put a retransmission back at the head of @q, behind the earlier
++ * retransmissions of its flow, so that the next A-MPDU is in order. */
++static void b43_ampdu_requeue(struct sk_buff_head *q, struct sk_buff *skb)
++{
++	struct ieee80211_hdr *hdr;
++	struct sk_buff *pos;
++	unsigned long flags;
++	u16 seq = b43_ampdu_seq(skb);
++
++	spin_lock_irqsave(&q->lock, flags);
++	skb_queue_walk(q, pos) {
++		hdr = (struct ieee80211_hdr *)pos->data;
++		if (!ieee80211_has_retry(hdr->frame_control) ||
++		    !b43_ampdu_same_flow(skb, pos) ||
++		    !ieee80211_sn_less(b43_ampdu_seq(pos), seq))
++			break;
++	}
++	/* At the end of the walk pos is the list head: append */
++	__skb_queue_before(q, pos, skb);
++	spin_unlock_irqrestore(&q->lock, flags);
++}
++
++/*
++ * Complete one A-MPDU from its status: the members acknowledged in the
++ * block ack bitmap and those out of retries go to mac80211, the others back
++ * to the queue. One rate control sample for the A-MPDU rides on a completed
++ * member (minstrel_ht skips the other members). Under wl->mutex.
++ */
++void b43_ampdu_txstatus(struct b43_wldev *dev,
++			const struct b43_txstatus *status)
++{
++	struct b43_wl *wl = dev->wl;
++	struct ieee80211_sta *sta = NULL;
++	struct b43_ampdu_tx_tid *t = NULL;
++	struct sk_buff_head mpdus, done, retry;
++	struct sk_buff *skb, *bar = NULL;
++	struct ieee80211_tx_info *info;
++	struct ieee80211_tx_rate rate = { .idx = -1 };
++	unsigned int n = 0, acked = 0;
++	int prio;
++
++	__skb_queue_head_init(&mpdus);
++	prio = b43_dma_ampdu_complete(dev, status, &mpdus);
++	if (prio < 0)
++		return;
++
++	__skb_queue_head_init(&done);
++	__skb_queue_head_init(&retry);
++	rcu_read_lock();
++	while ((skb = __skb_dequeue(&mpdus))) {
++		struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
++		u8 *tries;
++
++		info = IEEE80211_SKB_CB(skb);
++		if (!n) {
++			t = b43_ampdu_tid(wl, skb, &sta);
++			rate = info->control.rates[0];
++		}
++		n++;
++		tries = t ? &t->retries[b43_ampdu_seq(skb) % B43_AMPDU_TX_WINDOW] :
++			    NULL;
++		if (b43_txstatus_mpdu_acked(status, skb)) {
++			acked++;
++			if (tries)
++				*tries = 0;
++			ieee80211_tx_info_clear_status(info);
++			info->flags |= IEEE80211_TX_STAT_ACK;
++			__skb_queue_tail(&done, skb);
++		} else if (t && t->buf_size && *tries < B43_AMPDU_TX_RETRY_LIMIT) {
++			/* A probe tries its rate once, then goes on as an
++			 * ordinary frame */
++			info->flags &= ~IEEE80211_TX_CTL_RATE_CTRL_PROBE;
++			(*tries)++;
++			hdr->frame_control |= cpu_to_le16(IEEE80211_FCTL_RETRY);
++			__skb_queue_tail(&retry, skb);
++		} else {
++			if (tries)
++				*tries = 0;
++			ieee80211_tx_info_clear_status(info);
++			__skb_queue_tail(&done, skb);
++			/* mac80211 sends a BAR past the last dropped member */
++			if (t && t->buf_size)
++				bar = skb;
++		}
++	}
++
++	if (t) {
++		skb = skb_peek(&done);
++		if (skb) {
++			info = IEEE80211_SKB_CB(skb);
++			info->flags |= IEEE80211_TX_STAT_AMPDU;
++			info->status.ampdu_len = min(n + t->rc_len, 255U);
++			info->status.ampdu_ack_len = min(acked + t->rc_acked, 255U);
++			info->status.rates[0].idx = rate.idx;
++			info->status.rates[0].flags = rate.flags;
++			info->status.rates[0].count = 1;
++			info->status.rates[1].idx = -1;
++			t->rc_len = 0;
++			t->rc_acked = 0;
++		} else {
++			t->rc_len = min(t->rc_len + n, 255U);
++			t->rc_acked = min(t->rc_acked + acked, 255U);
++		}
++	}
++	rcu_read_unlock();
++	if (bar)
++		IEEE80211_SKB_CB(bar)->flags |= IEEE80211_TX_STAT_AMPDU_NO_BACK;
++
++	while ((skb = __skb_dequeue(&retry)))
++		b43_ampdu_requeue(&wl->tx_queue[prio], skb);
++	while ((skb = __skb_dequeue(&done)))
++		ieee80211_tx_status(wl->hw, skb);
++	b43_dma_tx_wake(dev, prio);
++}
++
++/*
++ * mac80211's block ack sessions. RX: the microcode answers an A-MPDU with a
++ * block ack (b43_write_mac_bssid_templates() gives it our address) and
++ * mac80211 reorders. TX: b43_ampdu_tx() builds the A-MPDUs.
++ */
++int b43_ampdu_action(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++		     struct ieee80211_ampdu_params *params)
++{
++	struct b43_wl *wl = hw_to_b43_wl(hw);
++	struct b43_sta *bsta = (struct b43_sta *)params->sta->drv_priv;
++	struct b43_ampdu_tx_tid *t = NULL;
++	struct b43_wldev *dev;
++	int err = -EOPNOTSUPP;
++
++	if (params->tid < B43_AMPDU_TIDS)
++		t = &bsta->tid[params->tid];
++
++	switch (params->action) {
++	case IEEE80211_AMPDU_RX_START:
++	case IEEE80211_AMPDU_TX_START:
++		mutex_lock(&wl->mutex);
++		dev = wl->current_dev;
++		if (dev && b43_status(dev) >= B43_STAT_STARTED &&
++		    dev->phy.nphy_ht &&
++		    (params->action == IEEE80211_AMPDU_RX_START ||
++		     (t && modparam_ampdu_tx && !b43_using_pio_transfers(dev))))
++			err = 0;
++		/* No session for a flow of TCP ACKs; mac80211 asks again
++		 * later, by when it may carry bulk data */
++		if (!err && params->action == IEEE80211_AMPDU_TX_START &&
++		    b43_ampdu_flow_brief(t))
++			err = -EBUSY;
++		if (!err && params->action == IEEE80211_AMPDU_TX_START) {
++			t->stopping = false;
++			t->buf_size = 0;
++			memset(t->retries, 0, sizeof(t->retries));
++		}
++		mutex_unlock(&wl->mutex);
++		if (!err && params->action == IEEE80211_AMPDU_TX_START)
++			ieee80211_start_tx_ba_cb_irqsafe(vif, params->sta->addr,
++							 params->tid);
++		return err;
++	case IEEE80211_AMPDU_TX_OPERATIONAL:
++		if (!t)
++			return -EOPNOTSUPP;
++		mutex_lock(&wl->mutex);
++		t->buf_size = min_t(u16, params->buf_size, B43_AMPDU_TX_WINDOW);
++		mutex_unlock(&wl->mutex);
++		return 0;
++	case IEEE80211_AMPDU_TX_STOP_CONT:
++	case IEEE80211_AMPDU_TX_STOP_FLUSH:
++	case IEEE80211_AMPDU_TX_STOP_FLUSH_CONT:
++		/* Queued members go out as ordinary frames */
++		if (t) {
++			mutex_lock(&wl->mutex);
++			t->buf_size = 0;
++			mutex_unlock(&wl->mutex);
++		}
++		if (params->action == IEEE80211_AMPDU_TX_STOP_CONT)
++			ieee80211_stop_tx_ba_cb_irqsafe(vif, params->sta->addr,
++							params->tid);
++		return 0;
++	case IEEE80211_AMPDU_RX_STOP:
++		return 0;
++	default:
++		return -EOPNOTSUPP;
++	}
++}
+diff --git a/drivers/net/wireless/broadcom/b43/ampdu.h b/drivers/net/wireless/broadcom/b43/ampdu.h
+new file mode 100644
+index 0000000..6d1e7f0
+--- /dev/null
++++ b/drivers/net/wireless/broadcom/b43/ampdu.h
+@@ -0,0 +1,48 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef B43_AMPDU_H_
++#define B43_AMPDU_H_
++
++#include <linux/skbuff.h>
++#include <linux/types.h>
++#include <net/mac80211.h>
++
++struct b43_wldev;
++struct b43_txstatus;
++
++#define B43_AMPDU_TX_WINDOW	64
++#define B43_AMPDU_TX_MAX_MPDUS	32
++/* The data TIDs */
++#define B43_AMPDU_TIDS		8
++
++/* TX block ack state of one TID of a station, under wl->mutex */
++struct b43_ampdu_tx_tid {
++	/* Negotiated window, 0 while no session is operational */
++	u8 buf_size;
++	/* Driver retransmissions, by sequence number modulo the window */
++	u8 retries[B43_AMPDU_TX_WINDOW];
++	/* A-MPDUs whose members all went back for a retry: their rate
++	 * control sample rides on the next completed member */
++	u8 rc_len;
++	u8 rc_acked;
++	/* Recent data frames to the station on this TID, full sized and
++	 * short (TCP ACKs), halved as they add up; lockless estimates */
++	u16 bulk;
++	u16 brief;
++	/* The session's stop was asked for, the flow went short */
++	bool stopping;
++};
++
++/* mac80211's per-station driver data */
++struct b43_sta {
++	struct b43_ampdu_tx_tid tid[B43_AMPDU_TIDS];
++};
++
++int b43_ampdu_action(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++		     struct ieee80211_ampdu_params *params);
++int b43_ampdu_tx(struct b43_wldev *dev, struct sk_buff_head *q,
++		 u8 queue_prio);
++void b43_ampdu_classify(struct ieee80211_sta *sta, struct sk_buff *skb);
++void b43_ampdu_txstatus(struct b43_wldev *dev,
++			const struct b43_txstatus *status);
++
++#endif /* B43_AMPDU_H_ */
+diff --git a/drivers/net/wireless/broadcom/b43/b43.h b/drivers/net/wireless/broadcom/b43/b43.h
+index 485a1d2..8f8a160 100644
+--- a/drivers/net/wireless/broadcom/b43/b43.h
++++ b/drivers/net/wireless/broadcom/b43/b43.h
+@@ -16,6 +16,7 @@
+ #include "rfkill.h"
+ #include "bus.h"
+ #include "lo.h"
++#include "ampdu.h"
+ #include "phy_common.h"
+ 
+ 
+@@ -832,6 +833,9 @@ struct b43_wldev {
+ 	struct b43_wl *wl;
+ 	/* The last HT-SIG received, for the later MPDUs of an A-MPDU */
+ 	u8 rx_ht_sig[6];
++	/* An acked A-MPDU's TX status, until its block ack bitmap comes */
++	u32 ampdu_txstat[2];
++	bool ampdu_txstat_pending;
+ 	/* a completion event structure needed if this call is asynchronous */
+ 	struct completion fw_load_complete;
+ 
+@@ -903,6 +907,9 @@ struct b43_wldev {
+ };
+ 
+ /* Data structure for the WLAN parts (802.11 cores) of the b43 chip. */
++/* Frames a TX queue of b43 holds before mac80211's is stopped */
++#define B43_TXQ_MAX	128
++
+ struct b43_wl {
+ 	/* Pointer to the active wireless device on this chip */
+ 	struct b43_wldev *current_dev;
+@@ -972,6 +979,8 @@ struct b43_wl {
+ 
+ 	/* Flag that implement the queues stopping. */
+ 	bool tx_queue_stopped[B43_QOS_QUEUE_NUM];
++	/* Stopped by b43_op_tx() at B43_TXQ_MAX queued frames */
++	bool tx_queue_full[B43_QOS_QUEUE_NUM];
+ 
+ 	/* firmware loading work */
+ 	struct work_struct firmware_load;
+diff --git a/drivers/net/wireless/broadcom/b43/dma.c b/drivers/net/wireless/broadcom/b43/dma.c
+index ea853ef..6b8a4ee 100644
+--- a/drivers/net/wireless/broadcom/b43/dma.c
++++ b/drivers/net/wireless/broadcom/b43/dma.c
+@@ -1249,7 +1249,8 @@ struct b43_dmaring *parse_cookie(struct b43_wldev *dev, u16 cookie, int *slot)
+ }
+ 
+ static int dma_tx_fragment(struct b43_dmaring *ring,
+-			   struct sk_buff *skb)
++			   struct sk_buff *skb,
++			   const struct b43_txhdr_ampdu *ampdu)
+ {
+ 	const struct b43_dma_ops *ops = ring->ops;
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+@@ -1279,7 +1280,7 @@ static int dma_tx_fragment(struct b43_dmaring *ring,
+ 	header = &(ring->txhdr_cache[(slot / TX_SLOTS_PER_FRAME) * hdrsize]);
+ 	cookie = generate_cookie(ring, slot);
+ 	err = b43_generate_txhdr(ring->dev, header,
+-				 skb, info, cookie);
++				 skb, info, cookie, ampdu);
+ 	if (unlikely(err)) {
+ 		ring->current_slot = old_top_slot;
+ 		ring->used_slots = old_used_slots;
+@@ -1329,6 +1330,10 @@ static int dma_tx_fragment(struct b43_dmaring *ring,
+ 	}
+ 
+ 	ops->fill_descriptor(ring, desc, meta->dmaaddr, skb->len, 0, 1, 1);
++	if (ampdu) {
++		meta->ampdu = true;
++		meta->ampdu_last = ampdu->last;
++	}
+ 
+ 	if (info->flags & IEEE80211_TX_CTL_SEND_AFTER_DTIM) {
+ 		/* Tell the firmware about the cookie of the last
+@@ -1336,7 +1341,9 @@ static int dma_tx_fragment(struct b43_dmaring *ring,
+ 		b43_shm_write16(ring->dev, B43_SHM_SHARED,
+ 				B43_SHM_SH_MCASTCOOKIE, cookie);
+ 	}
+-	/* Now transfer the whole frame. */
++	/* Now transfer the whole frame, or the A-MPDU after its last member */
++	if (ampdu && !ampdu->last)
++		return 0;
+ 	wmb();
+ 	ops->poke_tx(ring, next_slot(ring, slot));
+ 	return 0;
+@@ -1445,7 +1452,7 @@ int b43_dma_tx(struct b43_wldev *dev, struct sk_buff *skb)
+ 	 * static, so we don't need to store it per frame. */
+ 	ring->queue_prio = skb_get_queue_mapping(skb);
+ 
+-	err = dma_tx_fragment(ring, skb);
++	err = dma_tx_fragment(ring, skb, NULL);
+ 	if (unlikely(err == -ENOKEY)) {
+ 		/* Drop this packet, as we don't have the encryption key
+ 		 * anymore and must not transmit it unencrypted. */
+@@ -1473,6 +1480,171 @@ out:
+ 	return err;
+ }
+ 
++/* Frames of an A-MPDU the ring of @queue_prio takes now */
++unsigned int b43_dma_tx_ampdu_room(struct b43_wldev *dev, u8 queue_prio)
++{
++	struct b43_dmaring *ring = select_ring_by_priority(dev, queue_prio);
++
++	if (ring->stopped || ring->ampdu_pending >= B43_AMPDU_TX_MAX_PENDING)
++		return 0;
++	/* Keep room for one more frame, as b43_dma_tx() does */
++	return max(free_slots(ring) / TX_SLOTS_PER_FRAME - 1, 0);
++}
++
++/* Whether the ring of @queue_prio is busy enough for a lone frame to wait
++ * for more: an A-MPDU or two frames in flight */
++bool b43_dma_tx_busy(struct b43_wldev *dev, u8 queue_prio)
++{
++	struct b43_dmaring *ring = select_ring_by_priority(dev, queue_prio);
++
++	return ring->ampdu_pending ||
++	       ring->used_slots >= 2 * TX_SLOTS_PER_FRAME;
++}
++
++/* Take back the slots after @old_used_slots that were not handed over */
++static void dma_tx_unwind(struct b43_dmaring *ring, int old_used_slots)
++{
++	const struct b43_dma_ops *ops = ring->ops;
++	struct b43_dmadesc_meta *meta;
++
++	while (ring->used_slots > old_used_slots) {
++		ops->idx2desc(ring, ring->current_slot, &meta);
++		if (meta->skb) {
++			struct b43_private_tx_info *priv_info =
++			     b43_get_priv_tx_info(IEEE80211_SKB_CB(meta->skb));
++
++			unmap_descbuffer(ring, meta->dmaaddr, meta->skb->len, 1);
++			kfree(priv_info->bouncebuffer);
++			priv_info->bouncebuffer = NULL;
++		} else {
++			unmap_descbuffer(ring, meta->dmaaddr,
++					 b43_txhdr_size(ring->dev), 1);
++		}
++		memset(meta, 0, sizeof(*meta));
++		ring->current_slot = prev_slot(ring, ring->current_slot);
++		ring->used_slots--;
++	}
++}
++
++/*
++ * Post the @n members of one A-MPDU, all or none: the hardware starts on it
++ * after the last one. Returns @n, or the index of the member that could not
++ * be posted (none of them is then), with its error in *err.
++ */
++int b43_dma_tx_ampdu(struct b43_wldev *dev, u8 queue_prio,
++		     struct sk_buff **skbs,
++		     const struct b43_txhdr_ampdu *ampdu, unsigned int n)
++{
++	struct b43_dmaring *ring = select_ring_by_priority(dev, queue_prio);
++	int old_used_slots = ring->used_slots;
++	unsigned int i;
++	int err;
++
++	if (free_slots(ring) < (n + 1) * TX_SLOTS_PER_FRAME)
++		return -ENOSPC;
++	ring->queue_prio = queue_prio;
++	for (i = 0; i < n; i++) {
++		err = dma_tx_fragment(ring, skbs[i], &ampdu[i]);
++		if (unlikely(err)) {
++			dma_tx_unwind(ring, old_used_slots);
++			if (err != -ENOKEY)
++				b43err(dev->wl, "DMA tx mapping failure\n");
++			return err;
++		}
++	}
++	ring->ampdu_pending++;
++	if (free_slots(ring) < TX_SLOTS_PER_FRAME) {
++		ieee80211_stop_queue(dev->wl->hw, queue_prio);
++		dev->wl->tx_queue_stopped[queue_prio] = 1;
++		ring->stopped = true;
++	}
++	return 0;
++}
++
++/*
++ * The members of the A-MPDU whose single status this is, in order, their
++ * slots freed. Returns the ring's queue, or -1 when the status matches no
++ * A-MPDU at the ring's start.
++ */
++int b43_dma_ampdu_complete(struct b43_wldev *dev,
++			   const struct b43_txstatus *status,
++			   struct sk_buff_head *mpdus)
++{
++	const struct b43_dma_ops *ops;
++	struct b43_dmaring *ring;
++	struct b43_dmadesc_meta *meta;
++	int slot, firstused;
++	bool last = false;
++
++	ring = parse_cookie(dev, status->cookie, &slot);
++	if (unlikely(!ring))
++		return -1;
++	ops = ring->ops;
++	firstused = ring->current_slot - ring->used_slots + 1;
++	if (firstused < 0)
++		firstused = ring->nr_slots + firstused;
++	if (unlikely(slot != firstused || ring->used_slots < 2)) {
++		b43dbg(dev->wl, "A-MPDU TX status for slot %d, not %d, ring %d\n",
++		       slot, firstused, ring->index);
++		return -1;
++	}
++	ops->idx2desc(ring, next_slot(ring, slot), &meta);
++	if (unlikely(!meta->ampdu)) {
++		/* Not sent as an A-MPDU: complete it as one frame */
++		b43_dma_handle_txstatus(dev, status);
++		return -1;
++	}
++
++	while (!last && ring->used_slots >= 2) {
++		struct ieee80211_tx_info *info;
++		struct b43_private_tx_info *priv_info;
++		struct sk_buff *skb;
++
++		ops->idx2desc(ring, next_slot(ring, slot), &meta);
++		skb = meta->skb;
++		if (unlikely(!meta->ampdu || !skb ||
++			     b43_dma_ptr_is_poisoned(skb))) {
++			b43dbg(dev->wl, "A-MPDU TX status ends at slot %d, ring %d\n",
++			       slot, ring->index);
++			break;
++		}
++		last = meta->ampdu_last;
++		info = IEEE80211_SKB_CB(skb);
++		priv_info = b43_get_priv_tx_info(info);
++		unmap_descbuffer(ring, meta->dmaaddr, skb->len, 1);
++		kfree(priv_info->bouncebuffer);
++		priv_info->bouncebuffer = NULL;
++		meta->skb = B43_DMA_PTR_POISON;
++		ops->idx2desc(ring, slot, &meta);
++		unmap_descbuffer(ring, meta->dmaaddr, b43_txhdr_size(dev), 1);
++		ring->used_slots -= 2;
++		slot = next_slot(ring, next_slot(ring, slot));
++#ifdef CPTCFG_B43_DEBUG
++		if (b43_txstatus_mpdu_acked(status, skb))
++			ring->nr_succeed_tx_packets++;
++		else
++			ring->nr_failed_tx_packets++;
++		ring->nr_total_packet_tries++;
++#endif
++		__skb_queue_tail(mpdus, skb);
++	}
++	if (ring->ampdu_pending)
++		ring->ampdu_pending--;
++	if (ring->stopped && free_slots(ring) >= TX_SLOTS_PER_FRAME)
++		ring->stopped = false;
++	return ring->queue_prio;
++}
++
++/* As b43_dma_handle_txstatus() ends: let the queue run again */
++void b43_dma_tx_wake(struct b43_wldev *dev, u8 queue_prio)
++{
++	if (dev->wl->tx_queue_stopped[queue_prio])
++		dev->wl->tx_queue_stopped[queue_prio] = 0;
++	else
++		ieee80211_wake_queue(dev->wl->hw, queue_prio);
++	ieee80211_queue_work(dev->wl->hw, &dev->wl->tx_work);
++}
++
+ void b43_dma_handle_txstatus(struct b43_wldev *dev,
+ 			     const struct b43_txstatus *status)
+ {
+diff --git a/drivers/net/wireless/broadcom/b43/dma.h b/drivers/net/wireless/broadcom/b43/dma.h
+index ec72414..fbdd71a 100644
+--- a/drivers/net/wireless/broadcom/b43/dma.h
++++ b/drivers/net/wireless/broadcom/b43/dma.h
+@@ -190,6 +190,9 @@ struct b43_dmadesc_meta {
+ 	dma_addr_t dmaaddr;
+ 	/* ieee80211 TX status. Only used once per 802.11 frag. */
+ 	bool is_last_fragment;
++	/* The frame is an A-MPDU member, the last one */
++	bool ampdu;
++	bool ampdu_last;
+ };
+ 
+ struct b43_dmaring;
+@@ -260,6 +263,8 @@ struct b43_dmaring {
+ 	/* The QOS priority assigned to this ring. Only used for TX rings.
+ 	 * This is the mac80211 "queue" value. */
+ 	u8 queue_prio;
++	/* A-MPDUs posted that await their TX status */
++	u8 ampdu_pending;
+ 	struct b43_wldev *dev;
+ #ifdef CPTCFG_B43_DEBUG
+ 	/* Maximum number of used slots. */
+@@ -296,6 +301,19 @@ int b43_dma_tx(struct b43_wldev *dev,
+ void b43_dma_handle_txstatus(struct b43_wldev *dev,
+ 			     const struct b43_txstatus *status);
+ 
++struct b43_txhdr_ampdu;
++/* A-MPDUs a ring holds before the next one is built */
++#define B43_AMPDU_TX_MAX_PENDING	2
++unsigned int b43_dma_tx_ampdu_room(struct b43_wldev *dev, u8 queue_prio);
++bool b43_dma_tx_busy(struct b43_wldev *dev, u8 queue_prio);
++int b43_dma_tx_ampdu(struct b43_wldev *dev, u8 queue_prio,
++		     struct sk_buff **skbs,
++		     const struct b43_txhdr_ampdu *ampdu, unsigned int n);
++int b43_dma_ampdu_complete(struct b43_wldev *dev,
++			   const struct b43_txstatus *status,
++			   struct sk_buff_head *mpdus);
++void b43_dma_tx_wake(struct b43_wldev *dev, u8 queue_prio);
++
+ void b43_dma_handle_rx_overflow(struct b43_dmaring *ring);
+ 
+ void b43_dma_rx(struct b43_dmaring *ring);
+diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/broadcom/b43/main.c
+index 8a3430b..592552a 100644
+--- a/drivers/net/wireless/broadcom/b43/main.c
++++ b/drivers/net/wireless/broadcom/b43/main.c
+@@ -1359,30 +1359,76 @@ void b43_wireless_core_reset(struct b43_wldev *dev, bool gmode)
+ 	b43_write32(dev, B43_MMIO_MACCTL, macctl);
+ }
+ 
++static void b43_decode_txstatus(u32 v0, u32 v1, struct b43_txstatus *stat)
++{
++	u16 tmp;
++
++	stat->cookie = (v0 >> 16);
++	stat->seq = (v1 & 0x0000FFFF);
++	stat->phy_stat = ((v1 & 0x00FF0000) >> 16);
++	tmp = (v0 & 0x0000FFFF);
++	stat->frame_count = ((tmp & 0xF000) >> 12);
++	stat->rts_count = ((tmp & 0x0F00) >> 8);
++	stat->supp_reason = ((tmp & 0x001C) >> 2);
++	stat->pm_indicated = !!(tmp & 0x0080);
++	stat->intermediate = !!(tmp & 0x0040);
++	stat->for_ampdu = !!(tmp & 0x0020);
++	stat->acked = !!(tmp & 0x0002);
++	/* An A-MPDU's block ack bitmap starts at its first MPDU */
++	stat->ba_ssn = IEEE80211_SEQ_TO_SN(stat->seq);
++	stat->ba_bitmap = 0;
++}
++
+ static void handle_irq_transmit_status(struct b43_wldev *dev)
+ {
+ 	u32 v0, v1;
+-	u16 tmp;
+ 	struct b43_txstatus stat;
+ 
+ 	while (1) {
+ 		v0 = b43_read32(dev, B43_MMIO_XMITSTAT_0);
+-		if (!(v0 & 0x00000001))
+-			break;
+-		v1 = b43_read32(dev, B43_MMIO_XMITSTAT_1);
+-
+-		stat.cookie = (v0 >> 16);
+-		stat.seq = (v1 & 0x0000FFFF);
+-		stat.phy_stat = ((v1 & 0x00FF0000) >> 16);
+-		tmp = (v0 & 0x0000FFFF);
+-		stat.frame_count = ((tmp & 0xF000) >> 12);
+-		stat.rts_count = ((tmp & 0x0F00) >> 8);
+-		stat.supp_reason = ((tmp & 0x001C) >> 2);
+-		stat.pm_indicated = !!(tmp & 0x0080);
+-		stat.intermediate = !!(tmp & 0x0040);
+-		stat.for_ampdu = !!(tmp & 0x0020);
+-		stat.acked = !!(tmp & 0x0002);
++		if (dev->ampdu_txstat_pending) {
++			/* The block ack bitmap follows an acked A-MPDU's
++			 * status as a second package (as b43-next reads it) */
++			if (!(v0 & 0x00000001)) {
++				int i;
++
++				for (i = 0; i < 10 && !(v0 & 1); i++) {
++					udelay(1);
++					v0 = b43_read32(dev, B43_MMIO_XMITSTAT_0);
++				}
++				if (!(v0 & 1))
++					break;
++			}
++			v1 = b43_read32(dev, B43_MMIO_XMITSTAT_1);
++			b43_decode_txstatus(dev->ampdu_txstat[0],
++					    dev->ampdu_txstat[1], &stat);
++			dev->ampdu_txstat_pending = false;
++			if ((v0 & 0x0060) == 0x0020) {
++				stat.ba_bitmap = stat.frame_count |
++					((u64)((v0 >> 1) & 0xF) << 4) |
++					((u64)(v0 >> 8) << 8) |
++					((u64)v1 << 32);
++				b43_handle_txstatus(dev, &stat);
++				continue;
++			}
++			/* Not a bitmap: complete without the block ack and
++			 * take this pair as a new status */
++			b43dbg(dev->wl, "Missing A-MPDU block ack status 0x%08X\n", v0);
++			b43_handle_txstatus(dev, &stat);
++		} else {
++			if (!(v0 & 0x00000001))
++				break;
++			v1 = b43_read32(dev, B43_MMIO_XMITSTAT_1);
++		}
+ 
++		b43_decode_txstatus(v0, v1, &stat);
++		if (stat.for_ampdu && stat.acked) {
++			/* Bitmap bits 0-3 take the frame count's place */
++			dev->ampdu_txstat[0] = v0;
++			dev->ampdu_txstat[1] = v1;
++			dev->ampdu_txstat_pending = true;
++			continue;
++		}
+ 		b43_handle_txstatus(dev, &stat);
+ 	}
+ }
+@@ -1391,6 +1437,8 @@ static void drain_txstatus_queue(struct b43_wldev *dev)
+ {
+ 	u32 dummy;
+ 
++	dev->ampdu_txstat_pending = false;
++
+ 	if (dev->dev->core_rev < 5)
+ 		return;
+ 	/* Read all entries from the microcode TXstatus FIFO
+@@ -3282,6 +3330,87 @@ static void b43_chip_exit(struct b43_wldev *dev)
+ /* Initialize the chip
+  * http://bcm-specs.sipsolutions.net/ChipInit
+  */
++static void b43_txfifo_write(struct b43_wldev *dev, const u16 def[6][2],
++			     const u16 sizes[3])
++{
++	int i;
++
++	for (i = 0; i < 6; i++) {
++		u16 cmd = 0x8000 | (i << 8);	/* reset, select FIFO i */
++
++		b43_write16(dev, B43_MMIO_XMTFIFOCMD, cmd);
++		b43_write16(dev, B43_MMIO_XMTFIFODEF, def[i][0]);
++		b43_write16(dev, B43_MMIO_XMTFIFODEF1, def[i][1]);
++		b43_write16(dev, B43_MMIO_XMTFIFOCMD, cmd);
++	}
++	for (i = 0; i < 3; i++)
++		b43_shm_write16(dev, B43_SHM_SHARED, B43_SHM_SH_SIZE01 + 2 * i,
++				sizes[i]);
++}
++
++static bool b43_txfifo_check(struct b43_wldev *dev, const u16 def[6][2],
++			     const u16 sizes[3])
++{
++	bool ok = true;
++	int i;
++
++	for (i = 0; i < 6; i++) {
++		b43_write16(dev, B43_MMIO_XMTFIFOCMD, i << 8);
++		ok &= b43_read16(dev, B43_MMIO_XMTFIFODEF) == def[i][0];
++		ok &= b43_read16(dev, B43_MMIO_XMTFIFODEF1) == def[i][1];
++	}
++	for (i = 0; i < 3; i++)
++		ok &= b43_shm_read16(dev, B43_SHM_SHARED,
++				     B43_SHM_SH_SIZE01 + 2 * i) == sizes[i];
++	return ok;
++}
++
++/*
++ * The TX FIFOs of an 802.11n N-PHY core in 256-byte blocks from block 6,
++ * BK/BE/VI/VO/BCMC/ATIM, as brcmsmac sizes them on core rev 28 (BCM5357):
++ * the initvals of microcode 666 give BE 14 blocks, less than an A-MPDU of a
++ * few frames, which then underflows (PHY TX errors). The microcode keeps
++ * the sizes in shared memory in pairs, FIFO 2n low and 2n+1 high, as these
++ * initvals write them. Before the DMA rings and with the MAC disabled.
++ */
++static const u8 b43_txfifo_blocks_nphy[6] = { 9, 58, 22, 14, 14, 5 };
++
++static void b43_txfifo_init_nphy(struct b43_wldev *dev)
++{
++	u16 def[6][2], old_def[6][2], sizes[3], old_sizes[3];
++	u16 sel = b43_read16(dev, B43_MMIO_XMTFIFOCMD);
++	u16 start = 6, end;
++	int i;
++
++	if (dev->dev->core_rev != 28 ||
++	    (b43_read32(dev, B43_MMIO_MACCTL) & B43_MACCTL_ENABLED))
++		return;
++	for (i = 0; i < 6; i++) {
++		end = start + b43_txfifo_blocks_nphy[i] - 1;
++		def[i][0] = (end & 0xff) << 8 | (start & 0xff);
++		def[i][1] = ((end >> 8) & 1) << 8 | ((start >> 8) & 1);
++		start = end + 1;
++	}
++	for (i = 0; i < 3; i++)
++		sizes[i] = b43_txfifo_blocks_nphy[2 * i + 1] << 8 |
++			   b43_txfifo_blocks_nphy[2 * i];
++	for (i = 0; i < 6; i++) {
++		b43_write16(dev, B43_MMIO_XMTFIFOCMD, i << 8);
++		old_def[i][0] = b43_read16(dev, B43_MMIO_XMTFIFODEF);
++		old_def[i][1] = b43_read16(dev, B43_MMIO_XMTFIFODEF1);
++	}
++	for (i = 0; i < 3; i++)
++		old_sizes[i] = b43_shm_read16(dev, B43_SHM_SHARED,
++					      B43_SHM_SH_SIZE01 + 2 * i);
++
++	b43_txfifo_write(dev, def, sizes);
++	if (!b43_txfifo_check(dev, def, sizes)) {
++		b43warn(dev->wl, "TX FIFO resize failed, keeping the old sizes\n");
++		b43_txfifo_write(dev, old_def, old_sizes);
++	}
++	b43_write16(dev, B43_MMIO_XMTFIFOCMD, sel);
++}
++
+ static int b43_chip_init(struct b43_wldev *dev)
+ {
+ 	struct b43_phy *phy = &dev->phy;
+@@ -3311,6 +3440,9 @@ static int b43_chip_init(struct b43_wldev *dev)
+ 	err = b43_upload_initvals_band(dev);
+ 	if (err)
+ 		goto err_gpio_clean;
++	/* A-MPDUs need more of the TX FIFO RAM than these initvals give */
++	if (dev->phy.nphy_ht)
++		b43_txfifo_init_nphy(dev);
+ 
+ 	/* Turn the Analog on and initialize the PHY. */
+ 	phy->ops->switch_analog(dev, 1);
+@@ -3647,7 +3779,18 @@ static void b43_tx_work(struct work_struct *work)
+ 
+ 	for (queue_num = 0; queue_num < B43_QOS_QUEUE_NUM; queue_num++) {
+ 		while (skb_queue_len(&wl->tx_queue[queue_num])) {
++			/* The frames of a TX block ack session go in A-MPDUs */
++			err = b43_ampdu_tx(dev, &wl->tx_queue[queue_num],
++					   queue_num);
++			if (err == -ENOSPC)
++				break;
++			if (err) {
++				err = 0;
++				continue;
++			}
+ 			skb = skb_dequeue(&wl->tx_queue[queue_num]);
++			if (!skb)
++				break;
+ 			if (b43_using_pio_transfers(dev))
+ 				err = b43_pio_tx(dev, skb);
+ 			else
+@@ -3665,6 +3808,12 @@ static void b43_tx_work(struct work_struct *work)
+ 
+ 		if (!err)
+ 			wl->tx_queue_stopped[queue_num] = 0;
++		/* b43_op_tx() stopped mac80211's queue at B43_TXQ_MAX */
++		if (wl->tx_queue_full[queue_num] &&
++		    skb_queue_len(&wl->tx_queue[queue_num]) < B43_TXQ_MAX / 2) {
++			wl->tx_queue_full[queue_num] = false;
++			ieee80211_wake_queue(wl->hw, queue_num);
++		}
+ 	}
+ 
+ #if B43_DEBUG
+@@ -3686,7 +3835,15 @@ static void b43_op_tx(struct ieee80211_hw *hw,
+ 	}
+ 	B43_WARN_ON(skb_shinfo(skb)->nr_frags);
+ 
++	if (control)
++		b43_ampdu_classify(control->sta, skb);
+ 	skb_queue_tail(&wl->tx_queue[skb->queue_mapping], skb);
++	/* Frames wait here while the ring holds B43_AMPDU_TX_MAX_PENDING
++	 * A-MPDUs; bound them */
++	if (skb_queue_len(&wl->tx_queue[skb->queue_mapping]) >= B43_TXQ_MAX) {
++		wl->tx_queue_full[skb->queue_mapping] = true;
++		ieee80211_stop_queue(wl->hw, skb->queue_mapping);
++	}
+ 	if (!wl->tx_queue_stopped[skb->queue_mapping]) {
+ 		ieee80211_queue_work(wl->hw, &wl->tx_work);
+ 	} else {
+@@ -5261,32 +5418,6 @@ static int b43_op_get_antenna(struct ieee80211_hw *hw, u32 *tx_ant, u32 *rx_ant)
+ 	return 0;
+ }
+ 
+-/* Block ack sessions: RX only so far (the microcode answers A-MPDUs with
+- * block acks, mac80211 reorders); b43 does not build TX A-MPDUs. */
+-static int b43_op_ampdu_action(struct ieee80211_hw *hw,
+-			       struct ieee80211_vif *vif,
+-			       struct ieee80211_ampdu_params *params)
+-{
+-	struct b43_wl *wl = hw_to_b43_wl(hw);
+-	struct b43_wldev *dev;
+-	int err = -EOPNOTSUPP;
+-
+-	switch (params->action) {
+-	case IEEE80211_AMPDU_RX_START:
+-		mutex_lock(&wl->mutex);
+-		dev = wl->current_dev;
+-		if (dev && b43_status(dev) >= B43_STAT_STARTED &&
+-		    dev->phy.nphy_ht)
+-			err = 0;
+-		mutex_unlock(&wl->mutex);
+-		return err;
+-	case IEEE80211_AMPDU_RX_STOP:
+-		return 0;
+-	default:
+-		return -EOPNOTSUPP;
+-	}
+-}
+-
+ static const struct ieee80211_ops b43_hw_ops = {
+ 	.tx			= b43_op_tx,
+ 	.conf_tx		= b43_op_conf_tx,
+@@ -5309,7 +5440,7 @@ static const struct ieee80211_ops b43_hw_ops = {
+ 	.get_survey		= b43_op_get_survey,
+ 	.rfkill_poll		= b43_rfkill_poll,
+ 	.set_antenna		= b43_op_set_antenna,
+-	.ampdu_action		= b43_op_ampdu_action,
++	.ampdu_action		= b43_ampdu_action,
+ 	.get_antenna		= b43_op_get_antenna,
+ };
+ 
+@@ -5424,9 +5555,11 @@ static int b43_setup_bands(struct b43_wldev *dev,
+ 			ht->mcs.tx_params |= IEEE80211_HT_MCS_TX_RX_DIFF;
+ 		hw->wiphy->bands[NL80211_BAND_2GHZ] = band;
+ 		dev->phy.nphy_ht = true;
+-		/* RX A-MPDU: the microcode sends the block acks */
++		/* A-MPDU: the microcode sends the block acks, b43 builds
++		 * the A-MPDUs it sends (ampdu.c) */
+ 		ieee80211_hw_set(hw, AMPDU_AGGREGATION);
+ 		hw->max_rx_aggregation_subframes = IEEE80211_MAX_AMPDU_BUF_HT;
++		hw->max_tx_aggregation_subframes = B43_AMPDU_TX_WINDOW;
+ 	}
+ 
+ 	dev->phy.supports_2ghz = have_2ghz_phy;
+@@ -5748,6 +5881,7 @@ static struct b43_wl *b43_wireless_init(struct b43_bus_dev *dev)
+ 
+ 	wl->hw_registred = false;
+ 	hw->max_rates = 2;
++	hw->sta_data_size = sizeof(struct b43_sta);
+ 	SET_IEEE80211_DEV(hw, dev->dev);
+ 	if (is_valid_ether_addr(sprom->et1mac))
+ 		SET_IEEE80211_PERM_ADDR(hw, sprom->et1mac);
+diff --git a/drivers/net/wireless/broadcom/b43/pio.c b/drivers/net/wireless/broadcom/b43/pio.c
+index a4ff5e2..c2409cf 100644
+--- a/drivers/net/wireless/broadcom/b43/pio.c
++++ b/drivers/net/wireless/broadcom/b43/pio.c
+@@ -471,7 +471,7 @@ static int pio_tx_frame(struct b43_pio_txqueue *q,
+ 	BUILD_BUG_ON(sizeof(wl->pio_scratchspace) < sizeof(struct b43_txhdr));
+ 	B43_WARN_ON(sizeof(wl->pio_scratchspace) < hdrlen);
+ 	err = b43_generate_txhdr(dev, (u8 *)txhdr, skb,
+-				 info, cookie);
++				 info, cookie, NULL);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/drivers/net/wireless/broadcom/b43/xmit.c b/drivers/net/wireless/broadcom/b43/xmit.c
+index 2ec1ae7..800d49f 100644
+--- a/drivers/net/wireless/broadcom/b43/xmit.c
++++ b/drivers/net/wireless/broadcom/b43/xmit.c
+@@ -31,6 +31,7 @@
+ #include "phy_common.h"
+ #include "dma.h"
+ #include "pio.h"
++#include "ampdu.h"
+ 
+ static const struct b43_tx_legacy_rate_phy_ctl_entry b43_tx_legacy_rate_phy_ctl[] = {
+ 	{ B43_CCK_RATE_1MB,	0x0,			0x0 },
+@@ -104,29 +105,58 @@ static unsigned int b43_ht_airtime(u8 mcs, unsigned int octets)
+ }
+ 
+ /*
+- * The NAV of an acknowledged HT frame: SIFS and the ACK at the mandatory
+- * OFDM rate (24, 12 or 6 Mbit/s) at or below the MCS's legacy rate.
+- * mac80211 leaves it to the driver for MCS rates.
++ * The NAV of an acknowledged HT frame: SIFS and the response, a 14-byte ACK
++ * or a 32-byte compressed block ack, at the mandatory OFDM rate (24, 12 or
++ * 6 Mbit/s) at or below the MCS's legacy rate. mac80211 leaves it to the
++ * driver for MCS rates.
+  */
+-static u16 b43_ht_nav(u8 mcs)
++static u16 b43_ht_nav(u8 mcs, bool block_ack)
+ {
+ 	u8 rate = b43_mcs_legacy_rate[mcs % 8];
+ 	unsigned int ndbps = rate >= B43_OFDM_RATE_24MB ? 96 :
+ 			     rate >= B43_OFDM_RATE_12MB ? 48 : 24;
+ 
+-	return 10 + 20 + 4 * DIV_ROUND_UP(16 + 8 * 14 + 6, ndbps) + 6;
++	return 10 + 20 +
++	       4 * DIV_ROUND_UP(16 + 8 * (block_ack ? 32 : 14) + 6, ndbps) + 6;
+ }
+ 
+ /* The HT-SIG: MCS, 20 MHz, length; smoothing, not sounding, reserved bit
+- * set; no aggregation, STBC, LDPC or short GI. The PHY adds CRC and tail. */
++ * set; aggregation as asked; no STBC, LDPC or short GI. The PHY adds CRC
++ * and tail. */
+ static void b43_generate_ht_sig(struct b43_plcp_hdr6 *plcp, u8 mcs,
+-				unsigned int octets)
++				unsigned int octets, bool aggregation)
+ {
+ 	memset(plcp, 0, sizeof(*plcp));
+ 	plcp->raw[0] = mcs;
+ 	plcp->raw[1] = octets & 0xff;
+ 	plcp->raw[2] = octets >> 8;
+-	plcp->raw[3] = 0x07;
++	plcp->raw[3] = 0x07 | (aggregation ? 0x08 : 0);
++}
++
++/* On-air PSDU length of a TX frame: the hardware appends ICV and FCS. */
++unsigned int b43_tx_psdu_len(struct sk_buff *skb)
++{
++	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
++	unsigned int len = skb->len + FCS_LEN;
++
++	if (info->control.hw_key)
++		len += info->control.hw_key->icv_len;
++	return len;
++}
++
++/* The mixed-mode L-SIG length field (12 bits) limits an HT PPDU. */
++bool b43_ampdu_tx_fits(u8 mcs, unsigned int ampdu_len)
++{
++	return b43_ht_lsig_len(mcs, ampdu_len) <= 4095;
++}
++
++/* Bytes from one MPDU start to the next for the peer's density code:
++ * 2^(density - 3) us at the MCS, none for code 0. */
++unsigned int b43_ampdu_tx_spacing(u8 mcs, u8 density)
++{
++	unsigned int ndbps = b43_mcs_ndbps[mcs % 8] * (mcs / 8 + 1);
++
++	return density ? DIV_ROUND_UP((1 << density) * ndbps, 256) : 0;
+ }
+ 
+ static u16 b43_generate_tx_phy_ctl1_ht(struct b43_wldev *dev, u8 mcs)
+@@ -334,7 +364,8 @@ int b43_generate_txhdr(struct b43_wldev *dev,
+ 		       u8 *_txhdr,
+ 		       struct sk_buff *skb_frag,
+ 		       struct ieee80211_tx_info *info,
+-		       u16 cookie)
++		       u16 cookie,
++		       const struct b43_txhdr_ampdu *ampdu)
+ {
+ 	const unsigned char *fragment_data = skb_frag->data;
+ 	unsigned int fragment_len = skb_frag->len;
+@@ -360,6 +391,7 @@ int b43_generate_txhdr(struct b43_wldev *dev,
+ 		dev->wl->hw->wiphy->bands[info->band];
+ 	bool ht, ht_fb = false;
+ 	u8 mcs = 0, mcs_fb = 0;
++	unsigned int ppdu_len;
+ 
+ 	memset(txhdr, 0, sizeof(*txhdr));
+ 
+@@ -373,7 +405,7 @@ int b43_generate_txhdr(struct b43_wldev *dev,
+ 		if (b43_tx_rate_is_ht(dev, &rates[1])) {
+ 			ht_fb = true;
+ 			mcs_fb = rates[1].idx;
+-		} else if (rates[1].idx >= 0 && !(rates[1].flags & IEEE80211_TX_RC_MCS) &&
++		} else if (!ampdu && rates[1].idx >= 0 && !(rates[1].flags & IEEE80211_TX_RC_MCS) &&
+ 			   rates[1].idx < sband->n_bitrates) {
+ 			fbrate = &sband->bitrates[rates[1].idx];
+ 		} else {
+@@ -385,6 +417,9 @@ int b43_generate_txhdr(struct b43_wldev *dev,
+ 		rates[0].flags &= ~(IEEE80211_TX_RC_USE_RTS_CTS |
+ 				    IEEE80211_TX_RC_USE_CTS_PROTECT);
+ 	} else {
++		/* A-MPDU members go at an MCS */
++		if (ampdu)
++			return -EINVAL;
+ 		txrate = ieee80211_get_tx_rate(dev->wl->hw, info);
+ 		rate = txrate ? txrate->hw_value : B43_CCK_RATE_1MB;
+ 		/* A legacy rate falls back to itself rather than to an MCS */
+@@ -477,8 +512,8 @@ int b43_generate_txhdr(struct b43_wldev *dev,
+ 
+ 		if (!(info->flags & IEEE80211_TX_CTL_NO_ACK) &&
+ 		    !is_multicast_ether_addr(wlhdr->addr1)) {
+-			nav = b43_ht_nav(mcs);
+-			nav_fb = ht_fb ? b43_ht_nav(mcs_fb) : nav;
++			nav = b43_ht_nav(mcs, ampdu);
++			nav_fb = ht_fb ? b43_ht_nav(mcs_fb, ampdu) : nav;
+ 			if (ieee80211_has_morefrags(fctl)) {
+ 				/* the next fragment, at most as long as this */
+ 				nav = 3 * nav - 20 + b43_ht_airtime(mcs, plcp_fragment_len);
+@@ -491,8 +526,11 @@ int b43_generate_txhdr(struct b43_wldev *dev,
+ 		txhdr->dur_fb = ht_fb || !fbrate ? cpu_to_le16(nav_fb) :
+ 			ieee80211_generic_frame_duration(dev->wl->hw,
+ 				info->control.vif, info->band, fragment_len, fbrate);
+-		b43_generate_ht_sig(&txhdr->format_598.plcp, mcs, plcp_fragment_len);
+-		txhdr->mimo_modelen = cpu_to_le16(b43_ht_lsig_len(mcs, plcp_fragment_len));
++		/* The first member's PLCP describes the whole A-MPDU */
++		ppdu_len = ampdu && ampdu->first ? ampdu->len : plcp_fragment_len;
++		b43_generate_ht_sig(&txhdr->format_598.plcp, mcs, ppdu_len,
++				    ampdu && ampdu->first);
++		txhdr->mimo_modelen = cpu_to_le16(b43_ht_lsig_len(mcs, ppdu_len));
+ 	} else switch (dev->fw.hdr_format) {
+ 	case B43_FW_HDR_598:
+ 		b43_generate_plcp_hdr((struct b43_plcp_hdr4 *)(&txhdr->format_598.plcp),
+@@ -508,9 +546,11 @@ int b43_generate_txhdr(struct b43_wldev *dev,
+ 		break;
+ 	}
+ 	if (ht_fb) {
+-		b43_generate_ht_sig(&txhdr->plcp_fb, mcs_fb, plcp_fragment_len);
++		ppdu_len = ampdu && ampdu->first ? ampdu->len : plcp_fragment_len;
++		b43_generate_ht_sig(&txhdr->plcp_fb, mcs_fb, plcp_fragment_len,
++				    false);
+ 		txhdr->mimo_ratelen_fb =
+-			cpu_to_le16(b43_ht_lsig_len(mcs_fb, plcp_fragment_len));
++			cpu_to_le16(b43_ht_lsig_len(mcs_fb, ppdu_len));
+ 	} else {
+ 		b43_generate_plcp_hdr((struct b43_plcp_hdr4 *)(&txhdr->plcp_fb),
+ 				      plcp_fragment_len, rate_fb);
+@@ -566,8 +606,15 @@ int b43_generate_txhdr(struct b43_wldev *dev,
+ 	/* use hardware sequence counter as the non-TID counter */
+ 	if (info->flags & IEEE80211_TX_CTL_ASSIGN_SEQ)
+ 		mac_ctl |= B43_TXH_MAC_HWSEQ;
+-	if (info->flags & IEEE80211_TX_CTL_FIRST_FRAGMENT)
++	if ((info->flags & IEEE80211_TX_CTL_FIRST_FRAGMENT) &&
++	    (!ampdu || ampdu->first))
+ 		mac_ctl |= B43_TXH_MAC_STMSDU;
++	if (ampdu && ampdu->last)
++		mac_ctl |= B43_TXH_MAC_AMPDU_LAST;
++	else if (ampdu && ampdu->first)
++		mac_ctl |= B43_TXH_MAC_AMPDU_FIRST;
++	else if (ampdu)
++		mac_ctl |= B43_TXH_MAC_AMPDU_INTER;
+ 	if (!phy->gmode)
+ 		mac_ctl |= B43_TXH_MAC_5GHZ;
+ 
+@@ -726,6 +773,11 @@ int b43_generate_txhdr(struct b43_wldev *dev,
+ 			b43_generate_tx_phy_ctl1(dev, rate_fb));
+ 	}
+ 
++	/* The null delimiters after an A-MPDU member, in byte 5 of the RTS
++	 * fallback PLCP (a legacy PLCP uses bytes 0-3), as b43-next has it */
++	if (ampdu)
++		txhdr->rts_plcp_fb.raw[5] = ampdu->ndelim;
++
+ 	/* Apply the bitfields */
+ 	txhdr->mac_ctl = cpu_to_le32(mac_ctl);
+ 	txhdr->phy_ctl = cpu_to_le16(phy_ctl);
+@@ -1019,9 +1071,13 @@ void b43_handle_txstatus(struct b43_wldev *dev,
+ {
+ 	b43_debugfs_log_txstat(dev, status);
+ 
+-	if (status->intermediate)
++	if (status->for_ampdu) {
++		/* One status for a whole A-MPDU, only DMA sends them */
++		if (!b43_using_pio_transfers(dev))
++			b43_ampdu_txstatus(dev, status);
+ 		return;
+-	if (status->for_ampdu)
++	}
++	if (status->intermediate)
+ 		return;
+ 	if (!status->acked)
+ 		dev->wl->ieee_stats.dot11ACKFailureCount++;
+@@ -1056,6 +1112,17 @@ bool b43_fill_txstatus_report(struct b43_wldev *dev,
+ 	retry_limit = report->status.rates[0].count;
+ 	ieee80211_tx_info_clear_status(report);
+ 
++	/* A frame of a block ack session sent alone: minstrel_ht takes the
++	 * status of a CTL_AMPDU frame only with STAT_AMPDU */
++	if (report->flags & IEEE80211_TX_CTL_AMPDU) {
++		report->flags |= IEEE80211_TX_STAT_AMPDU;
++		report->status.ampdu_len = 1;
++		report->status.ampdu_ack_len = status->acked ? 1 : 0;
++		/* Dropped: mac80211's BAR moves the peer's reorder window
++		 * past it, or the peer holds the frames after it */
++		if (!status->acked)
++			report->flags |= IEEE80211_TX_STAT_AMPDU_NO_BACK;
++	}
+ 	if (status->acked) {
+ 		/* The frame was ACKed. */
+ 		report->flags |= IEEE80211_TX_STAT_ACK;
+@@ -1111,3 +1178,15 @@ void b43_tx_resume(struct b43_wldev *dev)
+ 	else
+ 		b43_dma_tx_resume(dev);
+ }
++
++/* Whether an A-MPDU member was acknowledged: the block ack came and has its
++ * bit, counted from the first member's sequence number. */
++bool b43_txstatus_mpdu_acked(const struct b43_txstatus *status,
++			     const struct sk_buff *skb)
++{
++	const struct ieee80211_hdr *hdr = (const void *)skb->data;
++	u16 sn = IEEE80211_SEQ_TO_SN(le16_to_cpu(hdr->seq_ctrl));
++	unsigned int off = (sn - status->ba_ssn) & IEEE80211_MAX_SN;
++
++	return status->acked && off < 64 && (status->ba_bitmap & BIT_ULL(off));
++}
+diff --git a/drivers/net/wireless/broadcom/b43/xmit.h b/drivers/net/wireless/broadcom/b43/xmit.h
+index 822b9b1..286dd77 100644
+--- a/drivers/net/wireless/broadcom/b43/xmit.h
++++ b/drivers/net/wireless/broadcom/b43/xmit.h
+@@ -204,10 +204,24 @@ size_t b43_txhdr_size(struct b43_wldev *dev)
+ }
+ 
+ 
++/* A-MPDU membership of one TX header */
++struct b43_txhdr_ampdu {
++	bool first;
++	bool last;
++	/* The whole A-MPDU's PSDU length, delimiters and padding included */
++	unsigned int len;
++	/* Null delimiters the microcode puts after this member */
++	u8 ndelim;
++};
++
+ int b43_generate_txhdr(struct b43_wldev *dev,
+-		       u8 * txhdr,
++		       u8 *txhdr,
+ 		       struct sk_buff *skb_frag,
+-		       struct ieee80211_tx_info *txctl, u16 cookie);
++		       struct ieee80211_tx_info *txctl, u16 cookie,
++		       const struct b43_txhdr_ampdu *ampdu);
++unsigned int b43_tx_psdu_len(struct sk_buff *skb);
++bool b43_ampdu_tx_fits(u8 mcs, unsigned int ampdu_len);
++unsigned int b43_ampdu_tx_spacing(u8 mcs, u8 density);
+ 
+ /* Transmit Status */
+ struct b43_txstatus {
+@@ -222,8 +236,13 @@ struct b43_txstatus {
+ 	u8 intermediate;	/* Intermediate status notification (not final) */
+ 	u8 for_ampdu;		/* Status is for an AMPDU (afterburner) */
+ 	u8 acked;		/* Wireless ACK received */
++	u16 ba_ssn;		/* A-MPDU: sequence number of the first MPDU */
++	u64 ba_bitmap;		/* A-MPDU: block ack bitmap from ba_ssn */
+ };
+ 
++bool b43_txstatus_mpdu_acked(const struct b43_txstatus *status,
++			     const struct sk_buff *skb);
++
+ /* txstatus supp_reason values */
+ enum {
+ 	B43_TXST_SUPP_NONE,	/* Not suppressed */
+-- 
+2.53.0
+
