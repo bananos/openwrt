@@ -1,0 +1,111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Druchenko <bananos@dev.co.ua>
+Date: Sat, 28 Nov 2026 12:38:43 +0200
+Subject: [PATCH] b43: N-PHY: rev 13 state as wl leaves it: T/R switch, ED
+ thresholds, LPF
+
+Three differences a register capture of wl 5.110 on an ASUS RT-N12 D1
+showed against b43 with the AP up:
+
+- The rev 7 RX I/Q calibration left the T/R switch override set in 0x2ff
+  after it (the intc override's bits); save and restore 0x2ff with the
+  other registers it changes.
+- wl writes the energy detect (CRS assert/deassert) thresholds on rev 17
+  as b43 does on revs 3-6; b43 left them at reset on rev 7+. Write them
+  for radio 2057 rev 13.
+- The RC calibration's S cap reads 0 on radio 2057 rev 13, so the LPF
+  entries in table 7 (0x152-0x179) lacked it; wl's carry an S cap equal
+  to the B cap. Use the B cap when the S cap reads 0.
+
+Throughput unchanged (channel 11, HT20, ht=1, back to back with the
+previous build: AP->client 12.2 Mbit/s, client->AP 21.9 for both).
+wl's aux ADC settings (table 8) were tried too and lowered both, so b43
+keeps its own.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/wireless/broadcom/b43/phy_n.c | 39 ++++++++++++++++++++---
+ 1 file changed, 35 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/b43/phy_n.c b/drivers/net/wireless/broadcom/b43/phy_n.c
+index 39c82bd..7854186 100644
+--- a/drivers/net/wireless/broadcom/b43/phy_n.c
++++ b/drivers/net/wireless/broadcom/b43/phy_n.c
+@@ -2883,6 +2883,14 @@ static void b43_nphy_workarounds_rev7plus(struct b43_wldev *dev)
+ 
+ 	bcap_val = b43_radio_read(dev, R2057_RCCAL_BCAP_VAL);
+ 	scap_val = b43_radio_read(dev, R2057_RCCAL_SCAP_VAL);
++	/* Radio 2057 rev 13: the S cap reads 0 here; wl 5.110's LPF values
++	 * on the RT-N12 D1 carry an S cap equal to the B cap */
++	if (phy->radio_rev == 13) {
++		b43dbg(dev->wl, "RC cal: B cap %u, S cap %u\n", bcap_val,
++		       scap_val);
++		if (!scap_val)
++			scap_val = bcap_val;
++	}
+ 
+ 	if (b43_nphy_ipa(dev)) {
+ 		bool ghz2 = b43_current_band(dev->wl) == NL80211_BAND_2GHZ;
+@@ -3238,6 +3246,28 @@ static void b43_nphy_workarounds_rev7plus(struct b43_wldev *dev)
+ 
+ 	b43_nphy_gain_ctl_workarounds(dev);
+ 
++	/* Radio 2057 rev 13: the energy detect thresholds wl 5.110 writes,
++	 * those of revs 3-6 */
++	if (phy->radio_rev == 13) {
++		static const u16 ed[][2] = {
++			{ B43_NPHY_ED_CRS40ASSERTTHRESH0, 0x03eb },
++			{ B43_NPHY_ED_CRS40ASSERTTHRESH1, 0x03eb },
++			{ B43_NPHY_ED_CRS40DEASSERTTHRESH0, 0x0341 },
++			{ B43_NPHY_ED_CRS40DEASSERTTHRESH1, 0x0341 },
++			{ B43_NPHY_ED_CRS20LASSERTTHRESH0, 0x042b },
++			{ B43_NPHY_ED_CRS20LASSERTTHRESH1, 0x042b },
++			{ B43_NPHY_ED_CRS20LDEASSERTTHRESH0, 0x0381 },
++			{ B43_NPHY_ED_CRS20LDEASSERTTHRESH1, 0x0381 },
++			{ B43_NPHY_ED_CRS20UASSERTTHRESH0, 0x042b },
++			{ B43_NPHY_ED_CRS20UASSERTTHRESH1, 0x042b },
++			{ B43_NPHY_ED_CRS20UDEASSERTTHRESH0, 0x0381 },
++			{ B43_NPHY_ED_CRS20UDEASSERTTHRESH1, 0x0381 },
++		};
++
++		for (core = 0; core < ARRAY_SIZE(ed); core++)
++			b43_phy_write(dev, ed[core][0], ed[core][1]);
++	}
++
+ 	/* TODO
+ 	b43_ntab_write_bulk(dev, B43_NTAB16(8, 0x08), 4,
+ 			    aux_adc_vmid_rev7_core0);
+@@ -6450,6 +6480,7 @@ static void b43_nphy_rxcal_txpwr_restore(struct b43_wldev *dev,
+ static const u16 b43_nphy_rxcal_phy_regs_rev7[] = {
+ 	0x0a2, 0x091, 0x092, 0x07a, 0x07d, 0x0e7, 0x0ec,
+ 	0x342, 0x343, 0x346, 0x347, 0x297, 0x29b,
++	0x2ff,	/* the T/R switch override bits */
+ };
+ 
+ static void b43_nphy_rxcal_phy_setup_rev7(struct b43_wldev *dev, u8 rx_core,
+@@ -6462,8 +6493,8 @@ static void b43_nphy_rxcal_phy_setup_rev7(struct b43_wldev *dev, u8 rx_core,
+ 
+ 	for (i = 0; i < ARRAY_SIZE(b43_nphy_rxcal_phy_regs_rev7); i++)
+ 		sv->phy[i] = b43_phy_read(dev, b43_nphy_rxcal_phy_regs_rev7[i]);
+-	sv->phy[13] = b43_phy_read(dev, afe_c);
+-	sv->phy[14] = b43_phy_read(dev, afe_over);
++	sv->phy[14] = b43_phy_read(dev, afe_c);
++	sv->phy[15] = b43_phy_read(dev, afe_over);
+ 
+ 	b43_phy_mask(dev, 0x297, ~0x0001);
+ 	b43_phy_mask(dev, 0x29b, ~0x0001);
+@@ -6498,9 +6529,9 @@ static void b43_nphy_rxcal_phy_cleanup_rev7(struct b43_wldev *dev, u8 rx_core,
+ 
+ 	for (i = 0; i < ARRAY_SIZE(b43_nphy_rxcal_phy_regs_rev7); i++)
+ 		b43_phy_write(dev, b43_nphy_rxcal_phy_regs_rev7[i], sv->phy[i]);
+-	b43_phy_write(dev, rx_core ? B43_NPHY_AFECTL_C2 : B43_NPHY_AFECTL_C1, sv->phy[13]);
++	b43_phy_write(dev, rx_core ? B43_NPHY_AFECTL_C2 : B43_NPHY_AFECTL_C1, sv->phy[14]);
+ 	b43_phy_write(dev, rx_core ? B43_NPHY_AFECTL_OVER : B43_NPHY_AFECTL_OVER1,
+-		      sv->phy[14]);
++		      sv->phy[15]);
+ }
+ 
+ /* the TX-RX coupler of radio 2057 at 2.4 GHz */
+-- 
+2.53.0
+
