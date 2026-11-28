@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Druchenko <bananos@dev.co.ua>
+Date: Sat, 28 Nov 2026 14:23:46 +0200
+Subject: [PATCH] b43: N-PHY: rev 13 upper gain update RF sequence as wl
+
+wl 5.110 programs RF sequence command 5 (update gain U: RX gain, clear
+HIQ disable, HPF bandwidth) on radio 2057 rev 13 with delays 6, 15, 1;
+b43 did so only on revs 1-2. Do it in the rev 13 2.4 GHz gain control
+setup.
+
+On an ASUS RT-N12 D1 the microcode's bad FCS and bad PLCP counters over
+a throughput run roughly halved (6290 / 2710 to 3048 / 1565); throughput
+is unchanged (AP->client 12.9 Mbit/s, client->AP 20.6).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/wireless/broadcom/b43/phy_n.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/drivers/net/wireless/broadcom/b43/phy_n.c b/drivers/net/wireless/broadcom/b43/phy_n.c
+index 7854186..9fe2acb 100644
+--- a/drivers/net/wireless/broadcom/b43/phy_n.c
++++ b/drivers/net/wireless/broadcom/b43/phy_n.c
+@@ -2563,6 +2563,16 @@ static void b43_nphy_gain_ctl_workarounds_2057_rev13_2g(struct b43_wldev *dev)
+ 	b43_phy_write(dev, B43_PHY_N(0x169), 0x1c02);
+ 	b43_phy_write(dev, B43_PHY_N(0x300), 0x0155);
+ 	b43_phy_write(dev, B43_PHY_N(0x301), 0x0155);
++
++	/* The RF sequence of an upper gain update (RX gain, clear HIQ
++	 * disable, HPF bandwidth), with wl's delays */
++	{
++		u8 events[] = { 0x7, 0x8, 0xe };
++		u8 delays[] = { 0x6, 0xf, 0x1 };
++
++		b43_nphy_set_rf_sequence(dev, B43_RFSEQ_UPDATE_GAINU, events,
++					 delays, ARRAY_SIZE(events));
++	}
+ }
+ 
+ static void b43_nphy_gain_ctl_workarounds_rev7(struct b43_wldev *dev)
+-- 
+2.53.0
+
